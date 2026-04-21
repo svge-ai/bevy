@@ -181,6 +181,132 @@ pub fn add_glyph_to_atlas(
         .ok_or(TextError::InconsistentAtlasState)
 }
 
+/// Rasterises a glyph with RGB subpixel antialiasing via `swash`, bypassing
+/// cosmic_text's [`SwashCache`](cosmic_text::SwashCache) (which hardcodes
+/// `swash::zeno::Format::Alpha`).
+///
+/// Mirrors the pattern from `cosmic-text-0.16.0/src/swash.rs:25–78`, but sets
+/// `.format(swash::zeno::Format::Subpixel)` to obtain RGB-packed coverage per
+/// channel.
+///
+/// swash's subpixel output is laid out as 4 bytes per pixel
+/// `[R_cov, G_cov, B_cov, 0]` (the 4th byte is never written by the
+/// rasteriser — see `zeno-0.3.3/src/mask.rs:260–372`). The buffer is therefore
+/// already `Rgba8UnormSrgb`-shaped; we just overwrite the alpha byte with 255
+/// so the output flows through the existing [`DynamicTextureAtlasBuilder`]
+/// path unchanged. The alpha-is-255 convention is intentional: the per-channel
+/// alpha lives in the RGB channels and is consumed by the subpixel fragment
+/// shader (wired up in phase-03).
+///
+/// No caching is performed here; repeated calls re-rasterise. A cache on top
+/// of this entry point is planned as a phase-04 follow-up.
+fn rasterise_subpixel_glyph(
+    font_system: &mut cosmic_text::FontSystem,
+    physical_glyph: &cosmic_text::PhysicalGlyph,
+) -> Result<(Image, IVec2), TextError> {
+    use swash::scale::{Render, ScaleContext, Source, StrikeWith};
+    use swash::zeno::{Format, Vector};
+
+    let cache_key = physical_glyph.cache_key;
+
+    let font = font_system
+        .get_font(cache_key.font_id, cache_key.font_weight)
+        .ok_or(TextError::FailedToGetGlyphImage(cache_key))?;
+
+    // Match cosmic_text's variable-font weight handling so `wght`-axis fonts
+    // rasterise identically between the grayscale and subpixel paths.
+    let variable_width = font
+        .as_swash()
+        .variations()
+        .find_by_tag(swash::Tag::from_be_bytes(*b"wght"));
+
+    let mut context = ScaleContext::new();
+    let mut scaler_builder = context
+        .builder(font.as_swash())
+        .size(f32::from_bits(cache_key.font_size_bits))
+        .hint(!cache_key
+            .flags
+            .contains(cosmic_text::CacheKeyFlags::DISABLE_HINTING));
+    if let Some(variation) = variable_width {
+        scaler_builder = scaler_builder.variations(core::iter::once(swash::Setting {
+            tag: swash::Tag::from_be_bytes(*b"wght"),
+            value: f32::from(cache_key.font_weight.0)
+                .clamp(variation.min_value(), variation.max_value()),
+        }));
+    }
+    let mut scaler = scaler_builder.build();
+
+    // Fractional offset — same quantisation as cosmic_text.
+    let offset = if cache_key
+        .flags
+        .contains(cosmic_text::CacheKeyFlags::PIXEL_FONT)
+    {
+        Vector::new(
+            cache_key.x_bin.as_float().round() + 1.0,
+            cache_key.y_bin.as_float().round(),
+        )
+    } else {
+        Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float())
+    };
+
+    let transform = if cache_key
+        .flags
+        .contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC)
+    {
+        Some(swash::zeno::Transform::skew(
+            swash::zeno::Angle::from_degrees(14.0),
+            swash::zeno::Angle::from_degrees(0.0),
+        ))
+    } else {
+        None
+    };
+
+    let image = Render::new(&[
+        Source::ColorOutline(0),
+        Source::ColorBitmap(StrikeWith::BestFit),
+        Source::Outline,
+    ])
+    .format(Format::Subpixel)
+    .offset(offset)
+    .transform(transform)
+    .render(&mut scaler, cache_key.glyph_id)
+    .ok_or(TextError::FailedToGetGlyphImage(cache_key))?;
+
+    let swash::zeno::Placement {
+        left,
+        top,
+        width,
+        height,
+    } = image.placement;
+
+    // swash emits `[R_cov, G_cov, B_cov, 0]` per pixel. Overwrite the unused
+    // 4th byte with 255 so the final image is a valid `Rgba8UnormSrgb` buffer.
+    let mut data = image.data;
+    debug_assert_eq!(
+        data.len(),
+        (width as usize) * (height as usize) * 4,
+        "swash subpixel output size mismatch; expected 4 bytes per pixel"
+    );
+    for pixel in data.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+
+    Ok((
+        Image::new(
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            data,
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::MAIN_WORLD,
+        ),
+        IVec2::new(left, top),
+    ))
+}
+
 /// Get the texture of the glyph as a rendered image, and its offset
 pub fn get_outlined_glyph_texture(
     font_system: &mut cosmic_text::FontSystem,
@@ -188,6 +314,14 @@ pub fn get_outlined_glyph_texture(
     physical_glyph: &cosmic_text::PhysicalGlyph,
     font_smoothing: FontSmoothing,
 ) -> Result<(Image, IVec2), TextError> {
+    // Subpixel rasterisation bypasses cosmic_text's `SwashCache` because the
+    // latter hardcodes `Format::Alpha` (see `cosmic-text-0.16.0/src/swash.rs:65`).
+    // The output of `rasterise_subpixel_glyph` is still an `Rgba8UnormSrgb`
+    // image, so it flows into the existing `FontAtlas` unchanged.
+    if font_smoothing == FontSmoothing::SubpixelAntiAliased {
+        return rasterise_subpixel_glyph(font_system, physical_glyph);
+    }
+
     // NOTE: Ideally, we'd ask COSMIC Text to honor the font smoothing setting directly.
     // However, since it currently doesn't support that, we render the glyph with antialiasing
     // and apply a threshold to the alpha channel to simulate the effect.

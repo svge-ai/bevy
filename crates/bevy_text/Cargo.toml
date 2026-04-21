@@ -33,11 +33,21 @@ bevy_platform = { path = "../bevy_platform", version = "0.18.0", default-feature
 # other
 wgpu-types = { version = "27", default-features = false }
 cosmic-text = { version = "0.16", features = ["shape-run-cache"] }
+# Added for `FontSmoothing::SubpixelAntiAliased` rasterisation. cosmic_text's
+# `SwashCache` hardcodes `swash::zeno::Format::Alpha`, so we call `swash`
+# directly for the subpixel path. Version must match the one `cosmic-text`
+# resolves transitively to avoid duplicate crate instances.
+swash = "0.2"
 thiserror = { version = "2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 smallvec = { version = "1", default-features = false }
 sys-locale = "0.3.0"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Needed by the subpixel rasterisation integration test to construct a
+# `cosmic_text::FontSystem` / `PhysicalGlyph` directly.
+cosmic-text = { version = "0.16", features = ["shape-run-cache"] }
 
 [lints]
 workspace = true
