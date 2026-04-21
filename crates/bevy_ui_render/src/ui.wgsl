@@ -1,3 +1,13 @@
+// `enable dual_source_blending;` must appear before any other global
+// declaration per the WGSL spec. We keep it unconditional (rather than gating
+// it on `#ifdef SUBPIXEL`) because naga_oil's preprocessor appears to still
+// consider the `#define_import_path` / `#import` lines as leading globals,
+// which makes a preprocessor-wrapped `enable` land "after" them. The directive
+// is harmless when the SUBPIXEL path is inactive — naga only requires the
+// corresponding DSB capability at compile time on pipelines that actually use
+// `@blend_src`.
+enable dual_source_blending;
+
 #define_import_path bevy_ui::ui_node
 
 #import bevy_render::view::View
@@ -214,7 +224,7 @@ fn draw_uinode_background(
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
 
-    // Only use the color sampled from the texture if the `TEXTURED` flag is enabled. 
+    // Only use the color sampled from the texture if the `TEXTURED` flag is enabled.
     // This allows us to draw both textured and untextured shapes together in the same batch.
     let color = select(in.color, in.color * texture_color, enabled(in.flags, TEXTURED));
 
@@ -224,3 +234,106 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         return draw_uinode_background(color, in.point, in.size, in.radius, in.border);
     }
 }
+
+#ifdef SUBPIXEL
+// RGB subpixel text fragment path.
+//
+// The glyph atlas bound to `sprite_texture` stores *three per-channel coverage
+// values* per pixel (one for each of the LCD stripe's R / G / B subpixels),
+// produced by `swash`'s `Format::Subpixel` rasteriser in `bevy_text`. The sample
+// is therefore not a colour — each channel is an alpha for its matching
+// subpixel. We emit dual-source fragments so the hardware blender can consume
+// per-channel alpha: `@blend_src(0)` carries the foreground colour (premultiplied
+// by the red-channel alpha) and `@blend_src(1)` carries the per-channel alpha
+// that the destination factor `OneMinusSrc1` / `OneMinusSrc1Alpha` multiplies
+// against the existing framebuffer value.
+//
+// The contrast + gamma math is ported verbatim from Zed's GPUI subpixel shader
+// (`references/zed/crates/gpui_wgpu/src/shaders_subpixel.wgsl`), which in turn
+// follows Skia's LCD text correction. Enhanced-contrast is luminance-adapted
+// ("light-on-dark") so dark-mode text doesn't bloom; the gamma ratios are a
+// lookup-driven adjustment around a target gamma (GPUI's default is 1.8).
+//
+// TODO(phase-04): expose `enhanced_contrast` and `gamma_ratios` via a
+// `SubpixelTextSettings` uniform instead of hardcoding; defaults below mirror
+// GPUI's `RenderingParameters::new()`.
+struct SubpixelOutput {
+    @location(0) @blend_src(0) color: vec4<f32>,
+    @location(0) @blend_src(1) alpha_mask: vec4<f32>,
+}
+
+fn color_brightness(color: vec3<f32>) -> f32 {
+    return dot(color, vec3<f32>(0.30, 0.59, 0.11));
+}
+
+fn light_on_dark_contrast(enhanced_contrast: f32, color: vec3<f32>) -> f32 {
+    let brightness = color_brightness(color);
+    let multiplier = saturate(4.0 * (0.75 - brightness));
+    return enhanced_contrast * multiplier;
+}
+
+fn enhance_contrast3(alpha: vec3<f32>, k: f32) -> vec3<f32> {
+    return alpha * (k + 1.0) / (alpha * k + 1.0);
+}
+
+fn apply_alpha_correction3(a: vec3<f32>, b: vec3<f32>, g: vec4<f32>) -> vec3<f32> {
+    let brightness_adjustment = g.x * b + g.y;
+    let correction = brightness_adjustment * a + (g.z * b + g.w);
+    return a + a * (1.0 - a) * correction;
+}
+
+fn apply_contrast_and_gamma_correction3(
+    sample: vec3<f32>,
+    fg: vec3<f32>,
+    enhanced_contrast_factor: f32,
+    gamma_ratios: vec4<f32>,
+) -> vec3<f32> {
+    let enhanced_contrast = light_on_dark_contrast(enhanced_contrast_factor, fg);
+    let contrasted = enhance_contrast3(sample, enhanced_contrast);
+    return apply_alpha_correction3(contrasted, fg, gamma_ratios);
+}
+
+@fragment
+fn fragment_subpixel(in: VertexOutput) -> SubpixelOutput {
+    // Sample three per-channel alpha coverages from the RGB subpixel atlas.
+    let sample_rgb = textureSample(sprite_texture, sprite_sampler, in.uv).rgb;
+
+    // Hardcoded defaults mirroring GPUI's `RenderingParameters::new()`:
+    //   subpixel_enhanced_contrast = 0.5
+    //   gamma = 1.8 (maps to the row of GAMMA_INCORRECT_TARGET_RATIOS below)
+    //
+    // The gamma_ratios table is precomputed per the GPUI port (see
+    // `get_gamma_correction_ratios` in zed/crates/gpui/src/platform.rs); the
+    // values below are the gamma=1.8 row scaled by NORM13 ≈ NORM24 ≈ 4.0157,
+    // i.e. the values GPUI emits at runtime for gamma = 1.8.
+    //
+    //   ratios (before NORM*):
+    //     x =  0.1469 / 4.0  ≈ 0.036725
+    //     y = -0.8911 / 4.0  ≈ -0.222775
+    //     z =  1.4644 / 4.0  ≈ 0.3661
+    //     w = -0.3234 / 4.0  ≈ -0.08085
+    //   NORM13 = (0x10000 / (255 * 255)) * 4.0 ≈ 4.0157
+    //   NORM24 = (0x100 / 255) * 4.0           ≈ 4.0157
+    //
+    //   gamma_ratios = ratios * [NORM13, NORM24, NORM13, NORM24]
+    let enhanced_contrast: f32 = 0.5;
+    let gamma_ratios = vec4<f32>(0.14746, -0.89481, 1.47021, -0.32474);
+
+    let alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample_rgb,
+        in.color.rgb,
+        enhanced_contrast,
+        gamma_ratios,
+    );
+
+    // Matches GPUI's `fs_subpixel_sprite`. With pipeline blend state
+    // `color: { src = Src1, dst = OneMinusSrc1 }` this yields:
+    //   result.rgb = fg.rgb * (color.a * alpha_corrected)
+    //              + dst.rgb * (1 - color.a * alpha_corrected)
+    // i.e. per-channel coverage of the foreground over the existing pixel.
+    var out: SubpixelOutput;
+    out.color = vec4<f32>(in.color.rgb, 1.0);
+    out.alpha_mask = vec4<f32>(in.color.a * alpha_corrected, 1.0);
+    return out;
+}
+#endif

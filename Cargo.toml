@@ -3846,6 +3846,18 @@ category = "UI (User Interface)"
 wasm = true
 
 [[example]]
+name = "text_subpixel"
+path = "examples/ui/text_subpixel.rs"
+# Causes an ICE on docs.rs
+doc-scrape-examples = false
+
+[package.metadata.example.text_subpixel]
+name = "Text Subpixel Antialiasing"
+description = "Visual comparison of FontSmoothing::{None, AntiAliased, SubpixelAntiAliased} at small font sizes."
+category = "UI (User Interface)"
+wasm = false
+
+[[example]]
 name = "text_background_colors"
 path = "examples/ui/text_background_colors.rs"
 # Causes an ICE on docs.rs

@@ -5,6 +5,8 @@ use bevy_image::prelude::*;
 use bevy_math::{IVec2, Vec2};
 use bevy_reflect::Reflect;
 
+use crate::FontSmoothing;
+
 /// A glyph of a font, typically representing a single character, positioned in screen space.
 ///
 /// Contains information about how and where to render a glyph.
@@ -27,6 +29,11 @@ pub struct PositionedGlyph {
     pub byte_index: usize,
     /// The byte length of the glyph.
     pub byte_length: usize,
+    /// The [`FontSmoothing`] in effect when this glyph was rasterised into its atlas.
+    ///
+    /// Propagated to the render world so the UI renderer can pick the subpixel
+    /// pipeline variant for [`FontSmoothing::SubpixelAntiAliased`] atlases.
+    pub font_smoothing: FontSmoothing,
 }
 
 /// Information about a glyph in an atlas.

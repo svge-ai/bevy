@@ -63,8 +63,8 @@ use gradient::GradientPlugin;
 
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_text::{
-    ComputedTextBlock, PositionedGlyph, Strikethrough, StrikethroughColor, TextBackgroundColor,
-    TextColor, TextLayoutInfo, Underline, UnderlineColor,
+    ComputedTextBlock, FontSmoothing, PositionedGlyph, Strikethrough, StrikethroughColor,
+    TextBackgroundColor, TextColor, TextLayoutInfo, Underline, UnderlineColor,
 };
 use bevy_transform::components::GlobalTransform;
 use box_shadow::BoxShadowPlugin;
@@ -170,6 +170,35 @@ pub enum UiAntiAlias {
     Off,
 }
 
+/// Tracks whether the active wgpu adapter exposes
+/// [`wgpu::Features::DUAL_SOURCE_BLENDING`](https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.DUAL_SOURCE_BLENDING),
+/// which [`FontSmoothing::SubpixelAntiAliased`] requires for its dual-source
+/// blend shader in [`UiPipeline`].
+///
+/// Initialised once at render startup by [`init_ui_subpixel_capability`] from
+/// [`RenderDevice::features()`](bevy_render::renderer::RenderDevice::features).
+/// When `false`, [`queue_uinodes`] transparently forces the non-subpixel
+/// pipeline variant so subpixel glyphs render through the grayscale shader
+/// path (the R channel of the RGB coverage atlas is used as alpha — visual
+/// quality is reduced but not broken).
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct UiSubpixelCapable(pub bool);
+
+/// Render-startup system that initialises [`UiSubpixelCapable`] from the
+/// render device's advertised features.
+pub fn init_ui_subpixel_capability(mut commands: Commands, render_device: Res<RenderDevice>) {
+    let supported = render_device
+        .features()
+        .contains(WgpuFeatures::DUAL_SOURCE_BLENDING);
+    commands.insert_resource(UiSubpixelCapable(supported));
+    if !supported {
+        tracing::warn!(
+            "DUAL_SOURCE_BLENDING unavailable on this adapter; \
+             FontSmoothing::SubpixelAntiAliased will fall back to AntiAliased."
+        );
+    }
+}
+
 /// Number of shadow samples.
 /// A larger value will result in higher quality shadows.
 /// Default is 4, values higher than ~10 offer diminishing returns.
@@ -236,7 +265,10 @@ impl Plugin for UiRenderPlugin {
                 )
                     .chain(),
             )
-            .add_systems(RenderStartup, init_ui_pipeline)
+            .add_systems(
+                RenderStartup,
+                (init_ui_pipeline, init_ui_subpixel_capability),
+            )
             .add_systems(
                 ExtractSchedule,
                 (
@@ -384,6 +416,13 @@ pub enum ExtractedUiItem {
     Glyphs {
         /// Indices into [`ExtractedUiNodes::glyphs`]
         range: Range<usize>,
+        /// The [`FontSmoothing`] shared by every glyph in `range`. Used by
+        /// [`queue_uinodes`] to pick the subpixel-blend pipeline variant when
+        /// [`FontSmoothing::SubpixelAntiAliased`] and
+        /// [`UiSubpixelCapable::0`] are both true. All glyphs inside a range
+        /// share the same smoothing because [`FontAtlasKey`](bevy_text::FontAtlasKey)
+        /// partitions atlases by smoothing, and one atlas == one contiguous range.
+        font_smoothing: FontSmoothing,
     },
 }
 
@@ -956,6 +995,7 @@ pub fn extract_text_sections(
                 position,
                 atlas_info,
                 span_index,
+                font_smoothing,
                 ..
             },
         ) in text_layout_info.glyphs.iter().enumerate()
@@ -993,7 +1033,10 @@ pub fn extract_text_sections(
                     image: atlas_info.texture,
                     clip: clip.map(|clip| clip.clip),
                     extracted_camera_entity,
-                    item: ExtractedUiItem::Glyphs { range: start..end },
+                    item: ExtractedUiItem::Glyphs {
+                        range: start..end,
+                        font_smoothing: *font_smoothing,
+                    },
                     main_entity: entity.into(),
                     transform,
                 });
@@ -1061,6 +1104,7 @@ pub fn extract_text_shadows(
                 position,
                 atlas_info,
                 span_index,
+                font_smoothing,
                 ..
             },
         ) in text_layout_info.glyphs.iter().enumerate()
@@ -1086,7 +1130,10 @@ pub fn extract_text_shadows(
                     image: atlas_info.texture,
                     clip: clip.map(|clip| clip.clip),
                     extracted_camera_entity,
-                    item: ExtractedUiItem::Glyphs { range: start..end },
+                    item: ExtractedUiItem::Glyphs {
+                        range: start..end,
+                        font_smoothing: *font_smoothing,
+                    },
                     main_entity: entity.into(),
                 });
                 start = end;
@@ -1386,6 +1433,7 @@ pub fn queue_uinodes(
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
+    subpixel_capable: Res<UiSubpixelCapable>,
 ) {
     let draw_function = draw_functions.read().id::<DrawUi>();
     let mut current_camera_entity = Entity::PLACEHOLDER;
@@ -1413,12 +1461,26 @@ pub fn queue_uinodes(
             continue;
         };
 
+        // Glyph items tagged with `FontSmoothing::SubpixelAntiAliased` request the
+        // dual-source-blend pipeline variant, but only when the adapter actually
+        // supports DSB. On adapters without DSB we fall back to the grayscale
+        // pipeline; the RGB coverage atlas is still sampled, but `ui.wgsl`'s
+        // default `fragment` entry only uses the R channel, so the glyphs render
+        // as approximate grayscale AA without panicking.
+        let want_subpixel = match &extracted_uinode.item {
+            ExtractedUiItem::Glyphs { font_smoothing, .. } => {
+                *font_smoothing == FontSmoothing::SubpixelAntiAliased && subpixel_capable.0
+            }
+            ExtractedUiItem::Node { .. } => false,
+        };
+
         let pipeline = pipelines.specialize(
             &pipeline_cache,
             &ui_pipeline,
             UiPipelineKey {
                 hdr: view.hdr,
                 anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
+                subpixel: want_subpixel,
             },
         );
 
@@ -1723,7 +1785,7 @@ pub fn prepare_uinodes(
                         vertices_index += 6;
                         indices_index += 4;
                     }
-                    ExtractedUiItem::Glyphs { range } => {
+                    ExtractedUiItem::Glyphs { range, .. } => {
                         let image = gpu_images
                             .get(extracted_uinode.image)
                             .expect("Image was checked during batching and should still exist");

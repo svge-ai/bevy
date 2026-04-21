@@ -460,6 +460,7 @@ impl TextPipeline {
                         byte_index: layout_glyph.start,
                         byte_length: layout_glyph.end - layout_glyph.start,
                         line_index: line_i,
+                        font_smoothing,
                     };
                     layout_info.glyphs.push(pos_glyph);
                     Ok(())
