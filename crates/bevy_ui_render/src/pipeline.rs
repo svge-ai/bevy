@@ -53,7 +53,7 @@ pub struct UiPipelineKey {
     /// Whether this pipeline variant targets RGB subpixel text glyphs.
     ///
     /// When `true`, `UiPipeline::specialize` emits the dual-source-blend variant
-    /// (`fragment_subpixel` entry point, `SUBPIXEL` shader_def, `Src1`/`OneMinusSrc1`
+    /// (`fragment_subpixel` entry point, `SUBPIXEL` `shader_def`, `Src1`/`OneMinusSrc1`
     /// blend factors). Only enabled when the active adapter supports
     /// [`wgpu::Features::DUAL_SOURCE_BLENDING`](https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.DUAL_SOURCE_BLENDING);
     /// see [`crate::UiSubpixelCapable`].
@@ -141,7 +141,6 @@ impl SpecializedRenderPipeline for UiPipeline {
                     blend: Some(blend),
                     write_mask: ColorWrites::ALL,
                 })],
-                ..default()
             }),
             layout: vec![self.view_layout.clone(), self.image_layout.clone()],
             label: Some(if key.subpixel {

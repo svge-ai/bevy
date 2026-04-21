@@ -182,7 +182,7 @@ pub fn add_glyph_to_atlas(
 }
 
 /// Rasterises a glyph with RGB subpixel antialiasing via `swash`, bypassing
-/// cosmic_text's [`SwashCache`](cosmic_text::SwashCache) (which hardcodes
+/// `cosmic_text`'s [`SwashCache`](cosmic_text::SwashCache) (which hardcodes
 /// `swash::zeno::Format::Alpha`).
 ///
 /// Mirrors the pattern from `cosmic-text-0.16.0/src/swash.rs:25–78`, but sets
@@ -224,9 +224,11 @@ fn rasterise_subpixel_glyph(
     let mut scaler_builder = context
         .builder(font.as_swash())
         .size(f32::from_bits(cache_key.font_size_bits))
-        .hint(!cache_key
-            .flags
-            .contains(cosmic_text::CacheKeyFlags::DISABLE_HINTING));
+        .hint(
+            !cache_key
+                .flags
+                .contains(cosmic_text::CacheKeyFlags::DISABLE_HINTING),
+        );
     if let Some(variation) = variable_width {
         scaler_builder = scaler_builder.variations(core::iter::once(swash::Setting {
             tag: swash::Tag::from_be_bytes(*b"wght"),

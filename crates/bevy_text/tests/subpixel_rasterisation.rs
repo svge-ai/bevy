@@ -11,12 +11,12 @@
 //! `get_outlined_glyph_texture`, which requires a fully wired-up
 //! `cosmic_text::FontSystem` / `SwashCache` / `PhysicalGlyph`.
 
-use std::sync::Arc;
+extern crate alloc;
+
+use alloc::sync::Arc;
 
 use bevy_text::{get_outlined_glyph_texture, FontSmoothing};
-use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
-};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 
 /// Font shipped with Bevy, used here because it exercises the scalable
 /// outline path (where subpixel rasterisation actually differs from

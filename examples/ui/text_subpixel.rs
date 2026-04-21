@@ -1,26 +1,41 @@
-//! Visual comparison of the three [`FontSmoothing`] variants at three small
-//! font sizes.
+//! Side-by-side comparison of the three [`FontSmoothing`] variants at four
+//! font sizes, rendering realistic content (prose, a code snippet, and a
+//! run of digits) — the workloads where subpixel antialiasing matters most.
 //!
 //! Use this example to eyeball the quality difference between
 //! [`FontSmoothing::AntiAliased`] (Bevy's default grayscale AA) and
 //! [`FontSmoothing::SubpixelAntiAliased`] (the RGB subpixel path added in
-//! spec 0002). [`FontSmoothing::None`] is included as a reference point for
+//! this PR). [`FontSmoothing::None`] is included as a reference point for
 //! "no smoothing".
 //!
 //! On an adapter that supports `wgpu::Features::DUAL_SOURCE_BLENDING` (Metal,
-//! Vulkan on most modern GPUs, DX12), the subpixel row should look visibly
-//! sharper than the anti-aliased row at 10pt and 14pt — particularly on the
-//! vertical stems of `l`, `i`, `k`, `b`. On adapters without DSB, the subpixel
-//! row transparently falls back to grayscale AA (see [`UiSubpixelCapable`]
-//! in `bevy_ui_render`).
+//! Vulkan on most modern GPUs, DX12), the subpixel column should look visibly
+//! sharper than the anti-aliased column at 10pt and 14pt — particularly on
+//! the vertical stems of `l`, `i`, `k`, `b`, on the round strokes of digits,
+//! and on the small punctuation in the code snippet. On adapters without DSB
+//! the subpixel column transparently falls back to grayscale AA.
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::text::FontSmoothing;
 
-const PANGRAM: &str = "The quick brown fox jumps over the lazy dog";
+/// Prose sample — one line of English at four sizes exercises most of the
+/// Latin lowercase and caps.
+const PROSE: &str = "The quick brown fox jumps over the lazy dog.";
 
-const SIZES: [f32; 3] = [10.0, 14.0, 20.0];
+/// Code sample — punctuation and monospace proportions stress subpixel
+/// positioning.
+const CODE: &str = "fn render(ctx: &mut Context) -> Result<()> { ctx.flush() }";
+
+/// Digits — round strokes and small verticals are where grayscale AA looks
+/// worst and subpixel AA helps most.
+const DIGITS: &str = "0123456789  3.14159  1,234,567  -42";
+
+/// Four realistic body sizes: small UI label, reading text, heading, large
+/// display. Subpixel AA has the most visible impact at 10pt and 14pt; at
+/// 20pt and 32pt the three variants should converge.
+const SIZES: [f32; 4] = [10.0, 14.0, 20.0, 32.0];
+
 const SMOOTHINGS: [(FontSmoothing, &str); 3] = [
     (FontSmoothing::None, "None"),
     (FontSmoothing::AntiAliased, "AntiAliased"),
@@ -33,9 +48,10 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.08)))
         .add_systems(Startup, setup);
 
-    // Optional automated screenshot for phase-03 exit-criterion capture. Set
-    // `BEVY_TEXT_SUBPIXEL_SCREENSHOT=<path>` to have the example grab the
-    // primary window a few frames after startup and write a PNG to that path.
+    // Optional automated screenshot capture for CI / PR body asset generation.
+    // Set `BEVY_TEXT_SUBPIXEL_SCREENSHOT=<path>` to have the example grab the
+    // primary window a few frames after startup and write a PNG to that path,
+    // then exit.
     if let Ok(path) = std::env::var("BEVY_TEXT_SUBPIXEL_SCREENSHOT") {
         app.insert_resource(ScreenshotPath(path));
         app.insert_resource(ScreenshotFrame(0));
@@ -58,7 +74,7 @@ fn take_screenshot_after_warmup(
     mut exit: MessageWriter<AppExit>,
 ) {
     frame.0 += 1;
-    // Capture on frame 30 (≈0.5s at 60fps) so the atlas has warmed up.
+    // Capture on frame 30 (~0.5s at 60fps) so the atlas has warmed up.
     if frame.0 == 30 {
         commands
             .spawn(Screenshot::primary_window())
@@ -73,50 +89,139 @@ fn take_screenshot_after_warmup(
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn(Camera2d);
 
-    let font = asset_server.load("fonts/FiraMono-Medium.ttf");
+    let body_font = asset_server.load("fonts/FiraSans-Bold.ttf");
+    let mono_font = asset_server.load("fonts/FiraMono-Medium.ttf");
 
     commands
         .spawn(Node {
             width: percent(100),
             height: percent(100),
             flex_direction: FlexDirection::Column,
-            padding: UiRect::all(px(24)),
-            row_gap: px(18),
+            padding: UiRect::all(px(20)),
+            row_gap: px(12),
             ..default()
         })
-        .with_children(|parent| {
-            for (smoothing, label) in SMOOTHINGS {
-                parent
-                    .spawn(Node {
-                        flex_direction: FlexDirection::Column,
-                        row_gap: px(4),
-                        ..default()
-                    })
-                    .with_children(|row| {
+        .with_children(|root| {
+            // Caption.
+            root.spawn((
+                Text::new(
+                    "FontSmoothing comparison — three variants (columns) at four sizes \
+                     (rows). The SubpixelAntiAliased column should look visibly sharper \
+                     at 10pt and 14pt on a DSB-capable adapter; otherwise it falls back \
+                     to grayscale AA.",
+                ),
+                TextFont {
+                    font: body_font.clone(),
+                    font_size: 12.0,
+                    font_smoothing: FontSmoothing::AntiAliased,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.70, 0.70, 0.70)),
+            ));
+
+            // Column header row.
+            root.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: px(16),
+                ..default()
+            })
+            .with_children(|header| {
+                for (_, label) in SMOOTHINGS {
+                    header
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            flex_grow: 1.0,
+                            flex_basis: percent(0),
+                            ..default()
+                        })
+                        .with_children(|col| {
+                            col.spawn((
+                                Text::new(format!("FontSmoothing::{label}")),
+                                TextFont {
+                                    font: body_font.clone(),
+                                    font_size: 14.0,
+                                    font_smoothing: FontSmoothing::AntiAliased,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.55, 0.80, 1.0)),
+                            ));
+                        });
+                }
+            });
+
+            // Body: one row per font size, each row holds three cells.
+            for size in SIZES {
+                root.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(16),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for (smoothing, _) in SMOOTHINGS {
                         row.spawn((
-                            Text::new(format!("FontSmoothing::{label}")),
-                            TextFont {
-                                font: font.clone(),
-                                font_size: 13.0,
-                                font_smoothing: FontSmoothing::AntiAliased,
+                            Node {
+                                flex_direction: FlexDirection::Column,
+                                flex_grow: 1.0,
+                                flex_basis: percent(0),
+                                row_gap: px(2),
+                                padding: UiRect::all(px(8)),
+                                border: UiRect::all(px(1)),
                                 ..default()
                             },
-                            TextColor(Color::srgb(0.55, 0.80, 1.0)),
-                        ));
-
-                        for size in SIZES {
-                            row.spawn((
-                                Text::new(format!("{size:>4.1}pt  {PANGRAM}")),
+                            BorderColor::all(Color::srgb(0.18, 0.18, 0.18)),
+                            BackgroundColor(Color::srgb(0.04, 0.04, 0.04)),
+                        ))
+                        .with_children(|cell| {
+                            // Size badge.
+                            cell.spawn((
+                                Text::new(format!("{size:>4.1}pt")),
                                 TextFont {
-                                    font: font.clone(),
+                                    font: body_font.clone(),
+                                    font_size: 11.0,
+                                    font_smoothing: FontSmoothing::AntiAliased,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.45, 0.45, 0.45)),
+                            ));
+
+                            // Prose (sans).
+                            cell.spawn((
+                                Text::new(PROSE),
+                                TextFont {
+                                    font: body_font.clone(),
                                     font_size: size,
                                     font_smoothing: smoothing,
                                     ..default()
                                 },
                                 TextColor(Color::WHITE),
                             ));
-                        }
-                    });
+
+                            // Code (mono).
+                            cell.spawn((
+                                Text::new(CODE),
+                                TextFont {
+                                    font: mono_font.clone(),
+                                    font_size: size,
+                                    font_smoothing: smoothing,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.90, 0.90, 0.78)),
+                            ));
+
+                            // Digits (mono).
+                            cell.spawn((
+                                Text::new(DIGITS),
+                                TextFont {
+                                    font: mono_font.clone(),
+                                    font_size: size,
+                                    font_smoothing: smoothing,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.78, 0.88, 1.0)),
+                            ));
+                        });
+                    }
+                });
             }
         });
 }
