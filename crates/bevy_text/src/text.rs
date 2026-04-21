@@ -714,9 +714,9 @@ impl<T: Into<Color>> From<T> for UnderlineColor {
 }
 
 /// Determines which antialiasing method to use when rendering text. By default, text is
-/// rendered with grayscale antialiasing, but this can be changed to achieve a pixelated look.
-///
-/// **Note:** Subpixel antialiasing is not currently supported.
+/// rendered with grayscale antialiasing, which produces smooth text at most sizes. For higher
+/// horizontal sharpness on LCD displays at small sizes, [`FontSmoothing::SubpixelAntiAliased`]
+/// can be selected instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Reflect, Serialize, Deserialize)]
 #[reflect(Serialize, Deserialize, Clone, PartialEq, Hash, Default)]
 #[doc(alias = "antialiasing")]
@@ -733,8 +733,20 @@ pub enum FontSmoothing {
     /// even at small font sizes and low resolutions with modern vector fonts.
     #[default]
     AntiAliased,
-    // TODO: Add subpixel antialias support
-    // SubpixelAntiAliased,
+    /// RGB subpixel antialiasing — higher horizontal sharpness on LCD displays at small sizes.
+    ///
+    /// Uses RGB subpixel rasterisation via `swash::zeno::Format::Subpixel` and a
+    /// gamma-corrected dual-source-blend shader to triple the effective horizontal resolution
+    /// along the glyph's red / green / blue subpixels.
+    ///
+    /// Requires [`wgpu::Features::DUAL_SOURCE_BLENDING`](https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.DUAL_SOURCE_BLENDING)
+    /// on the current adapter. Adapters without dual-source blending (e.g. WebGL2, some older
+    /// Vulkan drivers) transparently fall back to [`FontSmoothing::AntiAliased`] rendering.
+    /// No user action is required for the fallback.
+    ///
+    /// Currently supported by `bevy_ui` text rendering. `Text2d` (via `bevy_sprite`) will adopt
+    /// this variant in a later release; until then it also falls back to `AntiAliased` there.
+    SubpixelAntiAliased,
 }
 
 /// System that detects changes to text blocks and sets `ComputedTextBlock::should_rerender`.
