@@ -3858,6 +3858,18 @@ category = "UI (User Interface)"
 wasm = false
 
 [[example]]
+name = "text2d_subpixel"
+path = "examples/2d/text2d_subpixel.rs"
+# Causes an ICE on docs.rs
+doc-scrape-examples = false
+
+[package.metadata.example.text2d_subpixel]
+name = "Text2d Subpixel Antialiasing"
+description = "Visual comparison of FontSmoothing::{None, AntiAliased, SubpixelAntiAliased} applied to world-space Text2d entities."
+category = "2D Rendering"
+wasm = false
+
+[[example]]
 name = "text_background_colors"
 path = "examples/ui/text_background_colors.rs"
 # Causes an ICE on docs.rs

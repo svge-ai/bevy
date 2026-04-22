@@ -39,6 +39,7 @@ mod font_atlas_set;
 mod font_loader;
 mod glyph;
 mod pipeline;
+mod subpixel;
 mod text;
 mod text_access;
 
@@ -50,6 +51,7 @@ pub use font_atlas_set::*;
 pub use font_loader::*;
 pub use glyph::*;
 pub use pipeline::*;
+pub use subpixel::*;
 pub use text::*;
 pub use text_access::*;
 
@@ -92,6 +94,18 @@ impl Plugin for TextPlugin {
             .init_resource::<CosmicFontSystem>()
             .init_resource::<SwashCache>()
             .init_resource::<TextIterScratch>()
+            // Subpixel text tuning knobs are owned by `bevy_text` (shared
+            // across `bevy_ui_render` and `bevy_sprite_render`). Initialised
+            // here so downstream apps can override either via
+            // `app.insert_resource(SubpixelTextSettings { .. })` /
+            // `app.insert_resource(SubpixelLcdLayout::HorizontalBgr)` without
+            // needing to reach into the render sub-app.
+            //
+            // `SubpixelCapable` is *not* initialised here — the value depends
+            // on the `RenderDevice`'s feature set, so each render crate's
+            // startup system installs it.
+            .init_resource::<SubpixelTextSettings>()
+            .init_resource::<SubpixelLcdLayout>()
             .add_systems(
                 PostUpdate,
                 free_unused_font_atlases_system.before(AssetEventSystems),

@@ -95,7 +95,17 @@ impl Plugin for SpriteRenderPlugin {
                 .init_resource::<SpriteAssetEvents>()
                 .init_resource::<SpriteBatches>()
                 .add_render_command::<Transparent2d, DrawSprite>()
-                .add_systems(RenderStartup, init_sprite_pipeline)
+                .add_systems(
+                    RenderStartup,
+                    (
+                        init_sprite_pipeline,
+                        // Only installed when the `bevy_text` feature is enabled.
+                        // Without `Text2d` there are no subpixel-flagged sprites,
+                        // so the `SubpixelCapable` resource is unused.
+                        #[cfg(feature = "bevy_text")]
+                        init_sprite_subpixel_capability,
+                    ),
+                )
                 .add_systems(
                     ExtractSchedule,
                     (
@@ -103,6 +113,14 @@ impl Plugin for SpriteRenderPlugin {
                         extract_sprite_events,
                         #[cfg(feature = "bevy_text")]
                         extract_text2d_sprite.after(SpriteSystems::ExtractSprites),
+                        // Copies `SubpixelTextSettings` / `SubpixelLcdLayout`
+                        // from the main world into `SpriteMeta::subpixel_settings`.
+                        // Without the `bevy_text` feature the uniform stays at
+                        // its default (GPUI gamma=1.8); the subpixel fragment
+                        // path still compiles but is never reached because no
+                        // sprite sets `ExtractedSprite::subpixel = true`.
+                        #[cfg(feature = "bevy_text")]
+                        extract_sprite_subpixel_text_settings,
                     ),
                 )
                 .add_systems(

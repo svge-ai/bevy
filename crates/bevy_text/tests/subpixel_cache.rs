@@ -15,10 +15,10 @@ use alloc::sync::Arc;
 
 use bevy_asset::Assets;
 use bevy_image::prelude::*;
-use bevy_text::{
-    add_glyph_to_atlas, FontAtlas, FontAtlasKey, FontSmoothing, SubpixelBucket,
+use bevy_text::{add_glyph_to_atlas, FontAtlas, FontAtlasKey, FontSmoothing, SubpixelBucket};
+use cosmic_text::{
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SubpixelBin, SwashCache, Weight,
 };
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SubpixelBin, SwashCache, Weight};
 use std::collections::HashMap;
 
 /// Font shipped with Bevy — matches the one used by the phase-02 rasterisation
@@ -59,7 +59,10 @@ fn shape_glyph_a(font_system: &mut FontSystem) -> cosmic_text::LayoutGlyph {
 ///
 /// `SubpixelBin::new` bins an `f32` into four buckets at sub-pixel stride
 /// 0.25; the returned `layout_glyph` reflects that offset.
-fn shift_to_bin(mut layout_glyph: cosmic_text::LayoutGlyph, bin: SubpixelBin) -> cosmic_text::LayoutGlyph {
+fn shift_to_bin(
+    mut layout_glyph: cosmic_text::LayoutGlyph,
+    bin: SubpixelBin,
+) -> cosmic_text::LayoutGlyph {
     let integer_x = layout_glyph.x.floor();
     let fractional = match bin {
         SubpixelBin::Zero => 0.0,
@@ -141,10 +144,7 @@ fn subpixel_bucket_partitions_atlas_and_caches_hit() {
     }
 
     // Capture state so we can assert round 2 is a pure cache hit.
-    let atlas_count_before = font_atlas_set
-        .values()
-        .map(Vec::len)
-        .sum::<usize>();
+    let atlas_count_before = font_atlas_set.values().map(Vec::len).sum::<usize>();
     let glyph_count_before = font_atlas_set
         .values()
         .flat_map(|atlases| atlases.iter().map(|a| a.glyph_to_atlas_index.len()))
@@ -179,10 +179,7 @@ fn subpixel_bucket_partitions_atlas_and_caches_hit() {
         .expect("subpixel rasterisation failed on repeat insert");
     }
 
-    let atlas_count_after = font_atlas_set
-        .values()
-        .map(Vec::len)
-        .sum::<usize>();
+    let atlas_count_after = font_atlas_set.values().map(Vec::len).sum::<usize>();
     let glyph_count_after = font_atlas_set
         .values()
         .flat_map(|atlases| atlases.iter().map(|a| a.glyph_to_atlas_index.len()))
@@ -229,7 +226,12 @@ fn non_subpixel_smoothing_uses_not_applicable_bucket() {
     let font_id = bevy_asset::AssetId::<bevy_text::Font>::invalid();
     let size = 32f32.to_bits();
 
-    for &bin in &[SubpixelBin::Zero, SubpixelBin::One, SubpixelBin::Two, SubpixelBin::Three] {
+    for &bin in &[
+        SubpixelBin::Zero,
+        SubpixelBin::One,
+        SubpixelBin::Two,
+        SubpixelBin::Three,
+    ] {
         let layout_glyph = shift_to_bin(base_glyph.clone(), bin);
         // For AntiAliased, always use `NotApplicable` — this mirrors what
         // `pipeline.rs` does and keeps all four offsets in the same atlas.

@@ -66,7 +66,7 @@ pub struct UiPipelineKey {
     /// (`fragment_subpixel` entry point, `SUBPIXEL` `shader_def`, `Src1`/`OneMinusSrc1`
     /// blend factors). Only enabled when the active adapter supports
     /// [`wgpu::Features::DUAL_SOURCE_BLENDING`](https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.DUAL_SOURCE_BLENDING);
-    /// see [`crate::UiSubpixelCapable`].
+    /// see [`bevy_text::SubpixelCapable`].
     pub subpixel: bool,
 }
 

@@ -170,143 +170,44 @@ pub enum UiAntiAlias {
     Off,
 }
 
-/// Tracks whether the active wgpu adapter exposes
-/// [`wgpu::Features::DUAL_SOURCE_BLENDING`](https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.DUAL_SOURCE_BLENDING),
-/// which [`FontSmoothing::SubpixelAntiAliased`] requires for its dual-source
-/// blend shader in [`UiPipeline`].
-///
-/// Initialised once at render startup by [`init_ui_subpixel_capability`] from
-/// [`RenderDevice::features()`](bevy_render::renderer::RenderDevice::features).
-/// When `false`, [`queue_uinodes`] transparently forces the non-subpixel
-/// pipeline variant so subpixel glyphs render through the grayscale shader
-/// path (the R channel of the RGB coverage atlas is used as alpha — visual
-/// quality is reduced but not broken).
-#[derive(Resource, Debug, Clone, Copy)]
-pub struct UiSubpixelCapable(pub bool);
+// `SubpixelCapable`, `SubpixelTextSettings`, and `SubpixelLcdLayout` were
+// originally defined here (spec/0002 phase-03 and spec/0002b phases 01–02).
+// Spec/0002b phase-04 moved them into `bevy_text` so that
+// `bevy_sprite_render`'s `Text2d` path can share the same tuning knobs. The
+// types are re-exported below under their old names for backward
+// compatibility; `UiSubpixelCapable` is a deprecated alias for
+// `SubpixelCapable`.
 
-/// Render-startup system that initialises [`UiSubpixelCapable`] from the
-/// render device's advertised features.
+// Backward-compatible re-exports. Downstream apps that previously wrote
+// `bevy_ui_render::SubpixelTextSettings` / `bevy_ui_render::SubpixelLcdLayout`
+// continue to compile; the canonical path is now `bevy_text::*`.
+#[doc(inline)]
+pub use bevy_text::{SubpixelCapable, SubpixelLcdLayout, SubpixelTextSettings};
+
+/// Deprecated alias for [`bevy_text::SubpixelCapable`]. Renamed in spec/0002b
+/// phase-04 when subpixel rendering was extended from the UI pipeline into
+/// the sprite-render (`Text2d`) pipeline; the `Ui` prefix no longer matched
+/// the actual scope.
+#[deprecated(
+    since = "0.18.1",
+    note = "renamed to `bevy_text::SubpixelCapable`; the resource is shared between `bevy_ui_render` and `bevy_sprite_render`"
+)]
+pub type UiSubpixelCapable = SubpixelCapable;
+
+/// Render-startup system that initialises [`SubpixelCapable`] from the render
+/// device's advertised features. `bevy_sprite_render` registers a parallel
+/// system (`init_sprite_subpixel_capability`); either one produces the same
+/// value, so whichever runs first wins and the other is a no-op replace.
 pub fn init_ui_subpixel_capability(mut commands: Commands, render_device: Res<RenderDevice>) {
     let supported = render_device
         .features()
         .contains(WgpuFeatures::DUAL_SOURCE_BLENDING);
-    commands.insert_resource(UiSubpixelCapable(supported));
+    commands.insert_resource(SubpixelCapable(supported));
     if !supported {
         tracing::warn!(
             "DUAL_SOURCE_BLENDING unavailable on this adapter; \
              FontSmoothing::SubpixelAntiAliased will fall back to AntiAliased."
         );
-    }
-}
-
-/// Tuning parameters for RGB subpixel antialiased text rendering.
-///
-/// Only consulted when [`FontSmoothing::SubpixelAntiAliased`] is active and
-/// [`UiSubpixelCapable`] is `true`. Defaults match GPUI's gamma=1.8 preset,
-/// which works well across dark and light UI backgrounds.
-///
-/// App authors tuning for a specific display or background can override:
-/// - `enhanced_contrast`: higher values yield more aggressive per-channel
-///   gamma; lower values are more muted (useful on very low-contrast
-///   backgrounds).
-/// - `gamma_ratios`: cubic-polynomial coefficients matching GPUI's
-///   `GAMMA_INCORRECT_TARGET_RATIOS` table. Alternate rows of that table
-///   correspond to different target gammas (1.0, 1.2, ... 2.2).
-///
-/// ```
-/// use bevy_math::Vec4;
-/// use bevy_ecs::prelude::*;
-/// use bevy_ui_render::SubpixelTextSettings;
-///
-/// # let mut world = World::new();
-/// world.insert_resource(SubpixelTextSettings {
-///     enhanced_contrast: 0.35,
-///     gamma_ratios: Vec4::new(0.14746, -0.89481, 1.47021, -0.32474),
-/// });
-/// ```
-#[derive(Resource, Debug, Clone, Copy)]
-pub struct SubpixelTextSettings {
-    /// Strength of the per-channel contrast boost applied before gamma
-    /// correction. GPUI's default is `0.5`.
-    pub enhanced_contrast: f32,
-    /// Cubic-polynomial coefficients used by the subpixel gamma correction.
-    /// Defaults match GPUI's gamma=1.8 row of `GAMMA_INCORRECT_TARGET_RATIOS`
-    /// scaled by `NORM13`/`NORM24`. See
-    /// `references/zed/crates/gpui/src/platform.rs::get_gamma_correction_ratios`
-    /// for the source table and the derivation.
-    pub gamma_ratios: Vec4,
-}
-
-impl Default for SubpixelTextSettings {
-    fn default() -> Self {
-        Self {
-            enhanced_contrast: 0.5,
-            gamma_ratios: Vec4::new(0.14746, -0.89481, 1.47021, -0.32474),
-        }
-    }
-}
-
-/// Subpixel arrangement of the target LCD panel.
-///
-/// Defaults to [`SubpixelLcdLayout::HorizontalRgb`] — the arrangement of
-/// ~99% of desktop LCDs and nearly all laptop panels. Override for BGR
-/// panels (some older displays) or rotated portrait displays.
-///
-/// Only consulted when [`FontSmoothing::SubpixelAntiAliased`] is active and
-/// [`UiSubpixelCapable`] is `true`. Automatic detection of the host panel's
-/// layout is deliberately out of scope — each platform's API is fiddly
-/// enough to be its own future spec.
-///
-/// # Limitations of the vertical variants
-///
-/// The glyph atlas is produced by
-/// `bevy_text::font_atlas::rasterise_subpixel_glyph`, which invokes `swash`
-/// with [`Format::Subpixel`](https://docs.rs/swash/latest/swash/zeno/enum.Format.html).
-/// swash emits three coverage values *per logical pixel*, pre-offset along
-/// the horizontal subpixel stripe. The atlas therefore already encodes the
-/// R-at-left / G-at-center / B-at-right geometry.
-///
-/// For [`SubpixelLcdLayout::HorizontalRgb`] the shader samples and emits the
-/// atlas RGB as-is. For [`SubpixelLcdLayout::HorizontalBgr`] the shader
-/// swizzles to `.bgr`, which inverts the colour-fringe direction — on a
-/// physically BGR panel this yields correct subpixel antialiasing.
-///
-/// The vertical variants ([`SubpixelLcdLayout::VerticalRgb`] /
-/// [`SubpixelLcdLayout::VerticalBgr`]) are wired through the same uniform so
-/// apps can toggle them, but correct vertical-subpixel antialiasing would
-/// require re-rasterising the glyph with a rotated subpixel direction — the
-/// current atlas is horizontally pre-offset and cannot be re-used. With this
-/// phase they still produce distinct output from `HorizontalRgb` (proof of
-/// wiring), but aren't actually correct on a vertical-subpixel panel. A
-/// follow-up spec can either rotate the sample pattern at rasterisation
-/// time or maintain a second vertical-subpixel atlas.
-#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SubpixelLcdLayout {
-    /// Red at left, green centered, blue at right. Default and most common.
-    #[default]
-    HorizontalRgb,
-    /// Blue at left, green centered, red at right. Some older displays.
-    HorizontalBgr,
-    /// Red at top, green centered, blue at bottom. See type-level note —
-    /// requires a rasteriser change to be visually correct; currently acts
-    /// as a proof-of-wiring knob only.
-    VerticalRgb,
-    /// Blue at top, green centered, red at bottom. See type-level note —
-    /// requires a rasteriser change to be visually correct.
-    VerticalBgr,
-}
-
-impl SubpixelLcdLayout {
-    /// Matches the discriminants consumed by `ui.wgsl`'s subpixel fragment
-    /// entry. Keep the numeric values in sync with the `LAYOUT_*` constants
-    /// declared in the shader.
-    pub(crate) fn shader_flags(self) -> u32 {
-        match self {
-            SubpixelLcdLayout::HorizontalRgb => 0,
-            SubpixelLcdLayout::HorizontalBgr => 1,
-            SubpixelLcdLayout::VerticalRgb => 2,
-            SubpixelLcdLayout::VerticalBgr => 3,
-        }
     }
 }
 
@@ -403,13 +304,11 @@ impl Plugin for UiRenderPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "ui.wgsl");
 
-        // Installed on the main app so `app.insert_resource(SubpixelTextSettings { .. })`
-        // or `app.insert_resource(SubpixelLcdLayout::HorizontalBgr)` works
-        // without needing to reach into the render sub-app. The render app
-        // mirrors both values into a shared uniform each frame via
-        // `extract_subpixel_text_settings`.
-        app.init_resource::<SubpixelTextSettings>();
-        app.init_resource::<SubpixelLcdLayout>();
+        // Note: `SubpixelTextSettings` and `SubpixelLcdLayout` are initialised
+        // by `bevy_text::TextPlugin` (consolidated in spec/0002b phase-04 so
+        // `bevy_sprite_render` can share the same tuning knobs). This plugin
+        // only needs to mirror the values into `UiMeta::subpixel_settings`
+        // each frame via `extract_subpixel_text_settings`.
 
         #[cfg(feature = "bevy_ui_debug")]
         app.init_resource::<UiDebugOptions>();
@@ -598,7 +497,7 @@ pub enum ExtractedUiItem {
         /// The [`FontSmoothing`] shared by every glyph in `range`. Used by
         /// [`queue_uinodes`] to pick the subpixel-blend pipeline variant when
         /// [`FontSmoothing::SubpixelAntiAliased`] and
-        /// [`UiSubpixelCapable::0`] are both true. All glyphs inside a range
+        /// [`SubpixelCapable::0`] are both true. All glyphs inside a range
         /// share the same smoothing because [`FontAtlasKey`](bevy_text::FontAtlasKey)
         /// partitions atlases by smoothing, and one atlas == one contiguous range.
         font_smoothing: FontSmoothing,
@@ -1618,7 +1517,7 @@ pub fn queue_uinodes(
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
-    subpixel_capable: Res<UiSubpixelCapable>,
+    subpixel_capable: Res<SubpixelCapable>,
 ) {
     let draw_function = draw_functions.read().id::<DrawUi>();
     let mut current_camera_entity = Entity::PLACEHOLDER;
@@ -1730,13 +1629,11 @@ pub fn prepare_uinodes(
         view_uniforms.uniforms.binding(),
         ui_meta.subpixel_settings.binding(),
     ) {
-        (Some(view_binding), Some(subpixel_binding)) => {
-            Some(render_device.create_bind_group(
-                "ui_view_bind_group",
-                &pipeline_cache.get_bind_group_layout(&ui_pipeline.view_layout),
-                &BindGroupEntries::sequential((view_binding, subpixel_binding)),
-            ))
-        }
+        (Some(view_binding), Some(subpixel_binding)) => Some(render_device.create_bind_group(
+            "ui_view_bind_group",
+            &pipeline_cache.get_bind_group_layout(&ui_pipeline.view_layout),
+            &BindGroupEntries::sequential((view_binding, subpixel_binding)),
+        )),
         _ => None,
     };
 

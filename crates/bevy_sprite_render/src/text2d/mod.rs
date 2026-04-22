@@ -15,8 +15,9 @@ use bevy_render::sync_world::TemporaryRenderEntity;
 use bevy_render::Extract;
 use bevy_sprite::{Anchor, Text2dShadow};
 use bevy_text::{
-    ComputedTextBlock, PositionedGlyph, Strikethrough, StrikethroughColor, TextBackgroundColor,
-    TextBounds, TextColor, TextLayoutInfo, Underline, UnderlineColor,
+    ComputedTextBlock, FontSmoothing, PositionedGlyph, Strikethrough, StrikethroughColor,
+    SubpixelCapable, TextBackgroundColor, TextBounds, TextColor, TextLayoutInfo, Underline,
+    UnderlineColor,
 };
 use bevy_transform::prelude::GlobalTransform;
 
@@ -50,7 +51,13 @@ pub fn extract_text2d_sprite(
             Option<&UnderlineColor>,
         )>,
     >,
+    subpixel_capable: Option<Res<SubpixelCapable>>,
 ) {
+    // On adapters without `DUAL_SOURCE_BLENDING` we force the grayscale
+    // pipeline even for SubpixelAntiAliased glyphs — the RGB coverage atlas
+    // is still sampled, but only the R channel is used as alpha. Matches
+    // the behaviour of `queue_uinodes` in `bevy_ui_render`.
+    let subpixel_capable = subpixel_capable.map(|s| s.0).unwrap_or(false);
     let mut start = extracted_slices.slices.len();
     let mut end = start + 1;
 
@@ -104,6 +111,9 @@ pub fn extract_text2d_sprite(
                     scaling_mode: None,
                     custom_size: Some(run.bounds.size()),
                 },
+                // Text background fills sample the default (1x1 white) atlas
+                // and don't need subpixel treatment.
+                subpixel: false,
             });
         }
 
@@ -118,6 +128,7 @@ pub fn extract_text2d_sprite(
                 PositionedGlyph {
                     position,
                     atlas_info,
+                    font_smoothing,
                     ..
                 },
             ) in text_layout_info.glyphs.iter().enumerate()
@@ -139,6 +150,8 @@ pub fn extract_text2d_sprite(
                     .is_none_or(|info| info.atlas_info.texture != atlas_info.texture)
                 {
                     let render_entity = commands.spawn(TemporaryRenderEntity).id();
+                    let subpixel =
+                        *font_smoothing == FontSmoothing::SubpixelAntiAliased && subpixel_capable;
                     extracted_sprites.sprites.push(ExtractedSprite {
                         main_entity,
                         render_entity,
@@ -150,6 +163,7 @@ pub fn extract_text2d_sprite(
                         kind: ExtractedSpriteKind::Slices {
                             indices: start..end,
                         },
+                        subpixel,
                     });
                     start = end;
                 }
@@ -184,6 +198,7 @@ pub fn extract_text2d_sprite(
                             scaling_mode: None,
                             custom_size: Some(run.strikethrough_size()),
                         },
+                        subpixel: false,
                     });
                 }
 
@@ -206,6 +221,7 @@ pub fn extract_text2d_sprite(
                             scaling_mode: None,
                             custom_size: Some(run.underline_size()),
                         },
+                        subpixel: false,
                     });
                 }
             }
@@ -222,6 +238,7 @@ pub fn extract_text2d_sprite(
                 position,
                 atlas_info,
                 span_index,
+                font_smoothing,
                 ..
             },
         ) in text_layout_info.glyphs.iter().enumerate()
@@ -254,6 +271,14 @@ pub fn extract_text2d_sprite(
                 info.span_index != current_span || info.atlas_info.texture != atlas_info.texture
             }) {
                 let render_entity = commands.spawn(TemporaryRenderEntity).id();
+                // Glyphs in a single `ExtractedSpriteKind::Slices` share an
+                // atlas texture, and `FontAtlasKey` partitions atlases by
+                // `FontSmoothing` (see `bevy_text::font_atlas_set`), so all
+                // glyphs in this range have the same `font_smoothing`. Pick
+                // the subpixel pipeline variant when the adapter supports
+                // `DUAL_SOURCE_BLENDING`; otherwise fall back to grayscale AA.
+                let subpixel =
+                    *font_smoothing == FontSmoothing::SubpixelAntiAliased && subpixel_capable;
                 extracted_sprites.sprites.push(ExtractedSprite {
                     main_entity,
                     render_entity,
@@ -265,6 +290,7 @@ pub fn extract_text2d_sprite(
                     kind: ExtractedSpriteKind::Slices {
                         indices: start..end,
                     },
+                    subpixel,
                 });
                 start = end;
             }
@@ -309,6 +335,7 @@ pub fn extract_text2d_sprite(
                         scaling_mode: None,
                         custom_size: Some(run.strikethrough_size()),
                     },
+                    subpixel: false,
                 });
             }
 
@@ -337,6 +364,7 @@ pub fn extract_text2d_sprite(
                         scaling_mode: None,
                         custom_size: Some(run.underline_size()),
                     },
+                    subpixel: false,
                 });
             }
         }
