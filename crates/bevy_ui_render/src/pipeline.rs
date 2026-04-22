@@ -1,3 +1,4 @@
+use crate::SubpixelTextUniforms;
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_ecs::prelude::*;
 use bevy_image::BevyDefault as _;
@@ -20,11 +21,20 @@ pub struct UiPipeline {
 }
 
 pub fn init_ui_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) {
+    // Binding 1 is the `SubpixelTextSettings` uniform (see
+    // `crate::extract_subpixel_text_settings`). It is declared on every UI
+    // pipeline variant — including the non-subpixel path — so the view bind
+    // group layout is a single shared definition. The non-subpixel WGSL entry
+    // points simply don't reference the binding; naga/wgpu are fine with
+    // unused bindings as long as the layout matches.
     let view_layout = BindGroupLayoutDescriptor::new(
         "ui_view_layout",
-        &BindGroupLayoutEntries::single(
+        &BindGroupLayoutEntries::sequential(
             ShaderStages::VERTEX_FRAGMENT,
-            uniform_buffer::<ViewUniform>(true),
+            (
+                uniform_buffer::<ViewUniform>(true),
+                uniform_buffer::<SubpixelTextUniforms>(false),
+            ),
         ),
     );
 

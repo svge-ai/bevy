@@ -18,6 +18,7 @@
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::text::FontSmoothing;
+use bevy::ui_render::SubpixelTextSettings;
 
 /// Prose sample — one line of English at four sizes exercises most of the
 /// Latin lowercase and caps.
@@ -47,6 +48,18 @@ fn main() {
     app.add_plugins(DefaultPlugins)
         .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.08)))
         .add_systems(Startup, setup);
+
+    // Optional override of `SubpixelTextSettings::enhanced_contrast` for
+    // demonstrating the tunable. Parse `BEVY_TEXT_SUBPIXEL_ENHANCED_CONTRAST`
+    // (e.g. `=0.2` for a visibly muted look vs. the default `0.5`).
+    if let Ok(raw) = std::env::var("BEVY_TEXT_SUBPIXEL_ENHANCED_CONTRAST") {
+        if let Ok(value) = raw.trim().parse::<f32>() {
+            app.insert_resource(SubpixelTextSettings {
+                enhanced_contrast: value,
+                ..Default::default()
+            });
+        }
+    }
 
     // Optional automated screenshot capture for CI / PR body asset generation.
     // Set `BEVY_TEXT_SUBPIXEL_SCREENSHOT=<path>` to have the example grab the

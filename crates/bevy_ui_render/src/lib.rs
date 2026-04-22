@@ -39,7 +39,7 @@ use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
-use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2};
+use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2, Vec3, Vec4};
 use bevy_render::{
     render_asset::RenderAssets,
     render_graph::{Node as RenderGraphNode, NodeRunError, RenderGraph, RenderGraphContext},
@@ -199,6 +199,95 @@ pub fn init_ui_subpixel_capability(mut commands: Commands, render_device: Res<Re
     }
 }
 
+/// Tuning parameters for RGB subpixel antialiased text rendering.
+///
+/// Only consulted when [`FontSmoothing::SubpixelAntiAliased`] is active and
+/// [`UiSubpixelCapable`] is `true`. Defaults match GPUI's gamma=1.8 preset,
+/// which works well across dark and light UI backgrounds.
+///
+/// App authors tuning for a specific display or background can override:
+/// - `enhanced_contrast`: higher values yield more aggressive per-channel
+///   gamma; lower values are more muted (useful on very low-contrast
+///   backgrounds).
+/// - `gamma_ratios`: cubic-polynomial coefficients matching GPUI's
+///   `GAMMA_INCORRECT_TARGET_RATIOS` table. Alternate rows of that table
+///   correspond to different target gammas (1.0, 1.2, ... 2.2).
+///
+/// ```
+/// use bevy_math::Vec4;
+/// use bevy_ecs::prelude::*;
+/// use bevy_ui_render::SubpixelTextSettings;
+///
+/// # let mut world = World::new();
+/// world.insert_resource(SubpixelTextSettings {
+///     enhanced_contrast: 0.35,
+///     gamma_ratios: Vec4::new(0.14746, -0.89481, 1.47021, -0.32474),
+/// });
+/// ```
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct SubpixelTextSettings {
+    /// Strength of the per-channel contrast boost applied before gamma
+    /// correction. GPUI's default is `0.5`.
+    pub enhanced_contrast: f32,
+    /// Cubic-polynomial coefficients used by the subpixel gamma correction.
+    /// Defaults match GPUI's gamma=1.8 row of `GAMMA_INCORRECT_TARGET_RATIOS`
+    /// scaled by `NORM13`/`NORM24`. See
+    /// `references/zed/crates/gpui/src/platform.rs::get_gamma_correction_ratios`
+    /// for the source table and the derivation.
+    pub gamma_ratios: Vec4,
+}
+
+impl Default for SubpixelTextSettings {
+    fn default() -> Self {
+        Self {
+            enhanced_contrast: 0.5,
+            gamma_ratios: Vec4::new(0.14746, -0.89481, 1.47021, -0.32474),
+        }
+    }
+}
+
+/// GPU-facing form of [`SubpixelTextSettings`], written each frame into
+/// [`UiMeta::subpixel_settings`](UiMeta) and bound as `@group(0) @binding(1)`
+/// of the UI view bind group. `_pad` preserves `std140` 16-byte alignment
+/// between the scalar `enhanced_contrast` and the `vec4<f32> gamma_ratios`.
+#[derive(ShaderType, Clone, Copy, Debug)]
+pub struct SubpixelTextUniforms {
+    pub enhanced_contrast: f32,
+    pub _pad: Vec3,
+    pub gamma_ratios: Vec4,
+}
+
+impl Default for SubpixelTextUniforms {
+    fn default() -> Self {
+        Self::from(&SubpixelTextSettings::default())
+    }
+}
+
+impl From<&SubpixelTextSettings> for SubpixelTextUniforms {
+    fn from(settings: &SubpixelTextSettings) -> Self {
+        Self {
+            enhanced_contrast: settings.enhanced_contrast,
+            _pad: Vec3::ZERO,
+            gamma_ratios: settings.gamma_ratios,
+        }
+    }
+}
+
+/// Copies [`SubpixelTextSettings`] from the main world into
+/// [`UiMeta::subpixel_settings`] each frame. Runs in
+/// [`ExtractSchedule`]. The resource is cheap (32 bytes) so we unconditionally
+/// copy even when subpixel rendering is inactive — keeps the view bind group
+/// layout stable across both pipeline variants.
+pub fn extract_subpixel_text_settings(
+    settings: Extract<Res<SubpixelTextSettings>>,
+    mut ui_meta: ResMut<UiMeta>,
+) {
+    let settings: &SubpixelTextSettings = &settings;
+    ui_meta
+        .subpixel_settings
+        .set(SubpixelTextUniforms::from(settings));
+}
+
 /// Number of shadow samples.
 /// A larger value will result in higher quality shadows.
 /// Default is 4, values higher than ~10 offer diminishing returns.
@@ -232,6 +321,12 @@ pub struct UiRenderPlugin;
 impl Plugin for UiRenderPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "ui.wgsl");
+
+        // Installed on the main app so `app.insert_resource(SubpixelTextSettings { .. })`
+        // works without needing to reach into the render sub-app. The render
+        // app mirrors the value into a uniform each frame via
+        // `extract_subpixel_text_settings`.
+        app.init_resource::<SubpixelTextSettings>();
 
         #[cfg(feature = "bevy_ui_debug")]
         app.init_resource::<UiDebugOptions>();
@@ -280,6 +375,7 @@ impl Plugin for UiRenderPlugin {
                     extract_text_decorations.in_set(RenderUiSystems::ExtractTextBackgrounds),
                     extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
                     extract_text_sections.in_set(RenderUiSystems::ExtractText),
+                    extract_subpixel_text_settings,
                     #[cfg(feature = "bevy_ui_debug")]
                     debug_overlay::extract_debug_overlay.in_set(RenderUiSystems::ExtractDebug),
                 ),
@@ -1378,6 +1474,11 @@ pub struct UiMeta {
     vertices: RawBufferVec<UiVertex>,
     indices: RawBufferVec<u32>,
     view_bind_group: Option<BindGroup>,
+    /// Uniform buffer for [`SubpixelTextUniforms`]. Populated every frame by
+    /// [`extract_subpixel_text_settings`]. Bound at `@group(0) @binding(1)`
+    /// alongside the view uniform for all UI pipeline variants (including the
+    /// non-subpixel path) so the bind-group layout is shared.
+    pub(crate) subpixel_settings: UniformBuffer<SubpixelTextUniforms>,
 }
 
 impl Default for UiMeta {
@@ -1386,6 +1487,7 @@ impl Default for UiMeta {
             vertices: RawBufferVec::new(BufferUsages::VERTEX),
             indices: RawBufferVec::new(BufferUsages::INDEX),
             view_bind_group: None,
+            subpixel_settings: UniformBuffer::from(SubpixelTextUniforms::default()),
         }
     }
 }
@@ -1531,16 +1633,36 @@ pub fn prepare_uinodes(
         };
     }
 
-    if let Some(view_binding) = view_uniforms.uniforms.binding() {
+    // Flush the subpixel-text uniform to the GPU before building the bind
+    // group below — `subpixel_settings.binding()` is `None` until the backing
+    // buffer has been written at least once.
+    ui_meta
+        .subpixel_settings
+        .write_buffer(&render_device, &render_queue);
+
+    // Build the view bind group in a standalone scope so the immutable borrow
+    // of `ui_meta.subpixel_settings` released before we take `&mut ui_meta`
+    // borrows for `view_bind_group`, `vertices`, and `indices` below.
+    let view_bind_group = match (
+        view_uniforms.uniforms.binding(),
+        ui_meta.subpixel_settings.binding(),
+    ) {
+        (Some(view_binding), Some(subpixel_binding)) => {
+            Some(render_device.create_bind_group(
+                "ui_view_bind_group",
+                &pipeline_cache.get_bind_group_layout(&ui_pipeline.view_layout),
+                &BindGroupEntries::sequential((view_binding, subpixel_binding)),
+            ))
+        }
+        _ => None,
+    };
+
+    if let Some(view_bind_group) = view_bind_group {
         let mut batches: Vec<(Entity, UiBatch)> = Vec::with_capacity(*previous_len);
 
         ui_meta.vertices.clear();
         ui_meta.indices.clear();
-        ui_meta.view_bind_group = Some(render_device.create_bind_group(
-            "ui_view_bind_group",
-            &pipeline_cache.get_bind_group_layout(&ui_pipeline.view_layout),
-            &BindGroupEntries::single(view_binding),
-        ));
+        ui_meta.view_bind_group = Some(view_bind_group);
 
         // Buffer indexes
         let mut vertices_index = 0;

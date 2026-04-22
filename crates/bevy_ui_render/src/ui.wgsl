@@ -28,6 +28,20 @@ fn enabled(flags: u32, mask: u32) -> bool {
 
 @group(0) @binding(0) var<uniform> view: View;
 
+// Tuning parameters for `fragment_subpixel`, populated from the
+// `SubpixelTextSettings` resource by `extract_subpixel_text_settings` in
+// `bevy_ui_render/src/lib.rs`. Declared on every UI pipeline variant — even
+// the non-subpixel entry points — so the view bind group layout is shared.
+// The non-subpixel `fragment` entry simply doesn't reference this.
+struct SubpixelSettings {
+    enhanced_contrast: f32,
+    // Explicit padding matches the Rust `SubpixelTextUniforms::_pad` so the
+    // `vec4<f32>` below lands on a 16-byte boundary per std140 rules.
+    _pad: vec3<f32>,
+    gamma_ratios: vec4<f32>,
+}
+@group(0) @binding(1) var<uniform> subpixel_settings: SubpixelSettings;
+
 struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
@@ -254,9 +268,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 // ("light-on-dark") so dark-mode text doesn't bloom; the gamma ratios are a
 // lookup-driven adjustment around a target gamma (GPUI's default is 1.8).
 //
-// TODO(phase-04): expose `enhanced_contrast` and `gamma_ratios` via a
-// `SubpixelTextSettings` uniform instead of hardcoding; defaults below mirror
-// GPUI's `RenderingParameters::new()`.
+// The tuning values (`enhanced_contrast`, `gamma_ratios`) are read from the
+// `SubpixelSettings` uniform bound at `@group(0) @binding(1)`. The defaults
+// (spec/0002b phase-01) mirror GPUI's `RenderingParameters::new()`; apps can
+// override via `app.insert_resource(SubpixelTextSettings { .. })`.
 struct SubpixelOutput {
     @location(0) @blend_src(0) color: vec4<f32>,
     @location(0) @blend_src(1) alpha_mask: vec4<f32>,
@@ -298,26 +313,20 @@ fn fragment_subpixel(in: VertexOutput) -> SubpixelOutput {
     // Sample three per-channel alpha coverages from the RGB subpixel atlas.
     let sample_rgb = textureSample(sprite_texture, sprite_sampler, in.uv).rgb;
 
-    // Hardcoded defaults mirroring GPUI's `RenderingParameters::new()`:
+    // Tuning parameters come from the `SubpixelSettings` uniform (bound at
+    // `@group(0) @binding(1)`), populated each frame from
+    // `bevy_ui_render::SubpixelTextSettings`. Defaults mirror GPUI's
+    // `RenderingParameters::new()`:
     //   subpixel_enhanced_contrast = 0.5
-    //   gamma = 1.8 (maps to the row of GAMMA_INCORRECT_TARGET_RATIOS below)
+    //   gamma = 1.8 (maps to the gamma=1.8 row of GPUI's
+    //                `GAMMA_INCORRECT_TARGET_RATIOS`)
     //
     // The gamma_ratios table is precomputed per the GPUI port (see
     // `get_gamma_correction_ratios` in zed/crates/gpui/src/platform.rs); the
-    // values below are the gamma=1.8 row scaled by NORM13 ≈ NORM24 ≈ 4.0157,
+    // defaults in Rust are the gamma=1.8 row scaled by NORM13 ≈ NORM24 ≈ 4.0157,
     // i.e. the values GPUI emits at runtime for gamma = 1.8.
-    //
-    //   ratios (before NORM*):
-    //     x =  0.1469 / 4.0  ≈ 0.036725
-    //     y = -0.8911 / 4.0  ≈ -0.222775
-    //     z =  1.4644 / 4.0  ≈ 0.3661
-    //     w = -0.3234 / 4.0  ≈ -0.08085
-    //   NORM13 = (0x10000 / (255 * 255)) * 4.0 ≈ 4.0157
-    //   NORM24 = (0x100 / 255) * 4.0           ≈ 4.0157
-    //
-    //   gamma_ratios = ratios * [NORM13, NORM24, NORM13, NORM24]
-    let enhanced_contrast: f32 = 0.5;
-    let gamma_ratios = vec4<f32>(0.14746, -0.89481, 1.47021, -0.32474);
+    let enhanced_contrast = subpixel_settings.enhanced_contrast;
+    let gamma_ratios = subpixel_settings.gamma_ratios;
 
     let alpha_corrected = apply_contrast_and_gamma_correction3(
         sample_rgb,

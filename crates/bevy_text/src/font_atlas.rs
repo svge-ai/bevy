@@ -200,6 +200,13 @@ pub fn add_glyph_to_atlas(
 ///
 /// No caching is performed here; repeated calls re-rasterise. A cache on top
 /// of this entry point is planned as a phase-04 follow-up.
+//
+// TODO(cosmic-text#NNN): once cosmic_text exposes `swash::zeno::Format` as a
+// parameter on `SwashCache::get_image_uncached` (see
+// `agent-workspace/specs/0002b-bevy-subpixel-text-followups/artifacts/cosmic-text-issue.md`),
+// collapse this bespoke `swash` call into a one-liner against the upstream
+// cache. The `NNN` is the pop-os/cosmic-text issue number — filled in after the
+// user files the drafted issue via `gh issue create`.
 fn rasterise_subpixel_glyph(
     font_system: &mut cosmic_text::FontSystem,
     physical_glyph: &cosmic_text::PhysicalGlyph,
