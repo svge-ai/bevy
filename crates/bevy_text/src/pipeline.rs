@@ -19,7 +19,7 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use crate::{
     add_glyph_to_atlas, error::TextError, get_glyph_atlas_info, ComputedTextBlock, Font,
     FontAtlasKey, FontAtlasSet, FontHinting, FontSmoothing, Justify, LineBreak, LineHeight,
-    PositionedGlyph, TextBounds, TextEntity, TextFont, TextLayout,
+    PositionedGlyph, SubpixelBucket, TextBounds, TextEntity, TextFont, TextLayout,
 };
 use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Wrap};
 
@@ -416,12 +416,24 @@ impl TextPipeline {
 
                     let physical_glyph = layout_glyph.physical((0., 0.), 1.);
 
+                    // For subpixel-antialiased glyphs, partition atlases by
+                    // horizontal subpixel bucket so that `x=10.1` and `x=10.4`
+                    // do not evict each other. Non-subpixel smoothing modes
+                    // use `SubpixelBucket::NotApplicable`, matching prior
+                    // behaviour.
+                    let subpixel_bucket = if font_smoothing == FontSmoothing::SubpixelAntiAliased {
+                        SubpixelBucket::from(physical_glyph.cache_key.x_bin)
+                    } else {
+                        SubpixelBucket::NotApplicable
+                    };
+
                     let font_atlases = font_atlas_set
-                        .entry(FontAtlasKey(
-                            font_id,
-                            physical_glyph.cache_key.font_size_bits,
-                            font_smoothing,
-                        ))
+                        .entry(FontAtlasKey {
+                            font: font_id,
+                            size: physical_glyph.cache_key.font_size_bits,
+                            smoothing: font_smoothing,
+                            subpixel_bucket,
+                        })
                         .or_default();
 
                     let atlas_info = get_glyph_atlas_info(font_atlases, physical_glyph.cache_key)
