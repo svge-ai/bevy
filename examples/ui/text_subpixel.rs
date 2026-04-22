@@ -14,11 +14,45 @@
 //! the vertical stems of `l`, `i`, `k`, `b`, on the round strokes of digits,
 //! and on the small punctuation in the code snippet. On adapters without DSB
 //! the subpixel column transparently falls back to grayscale AA.
+//!
+//! # Interactive controls
+//!
+//! The example reacts to keyboard input while running so reviewers can
+//! A/B the tuning knobs without recompiling:
+//!
+//! | Key | Effect |
+//! |---|---|
+//! | `1` | Set [`SubpixelTextSettings::enhanced_contrast`] to `0.25` (muted) |
+//! | `2` | Set `enhanced_contrast` to `0.50` (default) |
+//! | `3` | Set `enhanced_contrast` to `0.75` (aggressive) |
+//! | `R` | Set [`SubpixelLcdLayout`] to `HorizontalRgb` (default) |
+//! | `B` | Set `SubpixelLcdLayout` to `HorizontalBgr` |
+//! | `V` | Set `SubpixelLcdLayout` to `VerticalRgb` |
+//! | `G` | Set `SubpixelLcdLayout` to `VerticalBgr` |
+//! | `S` | Save a screenshot of the primary window to `/tmp/text_subpixel_<unix-ms>.png` |
+//!
+//! A HUD in the top-right corner shows the current values. Changes take
+//! effect on the next rendered frame — `SubpixelTextSettings` and
+//! `SubpixelLcdLayout` are plain resources consumed by the subpixel fragment
+//! shader each frame.
+//!
+//! # Environment-variable overrides
+//!
+//! For automated screenshots and CI, three env vars override the initial
+//! values before any keypress:
+//!
+//! - `BEVY_TEXT_SUBPIXEL_ENHANCED_CONTRAST=<f32>` — initial contrast.
+//! - `BEVY_TEXT_SUBPIXEL_LCD_LAYOUT=<name>` — one of
+//!   `horizontal-rgb` / `horizontal-bgr` / `vertical-rgb` / `vertical-bgr`.
+//! - `BEVY_TEXT_SUBPIXEL_SCREENSHOT=<path>` — grab one screenshot after
+//!   warmup and exit (used for PR-body asset generation).
 
+use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::text::FontSmoothing;
 use bevy::ui_render::{SubpixelLcdLayout, SubpixelTextSettings};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Prose sample — one line of English at four sizes exercises most of the
 /// Latin lowercase and caps.
@@ -43,22 +77,27 @@ const SMOOTHINGS: [(FontSmoothing, &str); 3] = [
     (FontSmoothing::SubpixelAntiAliased, "SubpixelAntiAliased"),
 ];
 
+/// Marker on the HUD text entity so the update system can find it cheaply.
+#[derive(Component)]
+struct HudText;
+
 fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
         .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.08)))
-        .add_systems(Startup, setup);
+        .add_systems(Startup, setup)
+        .add_systems(Update, (handle_input, update_hud));
 
     // Optional override of `SubpixelTextSettings::enhanced_contrast` for
     // demonstrating the tunable. Parse `BEVY_TEXT_SUBPIXEL_ENHANCED_CONTRAST`
     // (e.g. `=0.2` for a visibly muted look vs. the default `0.5`).
-    if let Ok(raw) = std::env::var("BEVY_TEXT_SUBPIXEL_ENHANCED_CONTRAST") {
-        if let Ok(value) = raw.trim().parse::<f32>() {
-            app.insert_resource(SubpixelTextSettings {
-                enhanced_contrast: value,
-                ..Default::default()
-            });
-        }
+    if let Ok(raw) = std::env::var("BEVY_TEXT_SUBPIXEL_ENHANCED_CONTRAST")
+        && let Ok(value) = raw.trim().parse::<f32>()
+    {
+        app.insert_resource(SubpixelTextSettings {
+            enhanced_contrast: value,
+            ..Default::default()
+        });
     }
 
     // Optional override of `SubpixelLcdLayout` for demonstrating the layout
@@ -116,6 +155,80 @@ fn take_screenshot_after_warmup(
     if frame.0 >= 90 {
         exit.write(AppExit::Success);
     }
+}
+
+/// Reacts to keypresses to mutate the subpixel tuning resources. Using
+/// `just_pressed` gives us edge-triggered semantics — holding the key down
+/// doesn't spam updates.
+fn handle_input(
+    input: Res<ButtonInput<KeyCode>>,
+    mut commands: Commands,
+    mut settings: ResMut<SubpixelTextSettings>,
+    mut layout: ResMut<SubpixelLcdLayout>,
+) {
+    // Enhanced-contrast presets. Preserve the existing `gamma_ratios` so
+    // app authors who tuned them don't get silently clobbered by a keypress.
+    if input.just_pressed(KeyCode::Digit1) {
+        settings.enhanced_contrast = 0.25;
+    }
+    if input.just_pressed(KeyCode::Digit2) {
+        settings.enhanced_contrast = 0.50;
+    }
+    if input.just_pressed(KeyCode::Digit3) {
+        settings.enhanced_contrast = 0.75;
+    }
+
+    // LCD layout cycle.
+    if input.just_pressed(KeyCode::KeyR) {
+        *layout = SubpixelLcdLayout::HorizontalRgb;
+    }
+    if input.just_pressed(KeyCode::KeyB) {
+        *layout = SubpixelLcdLayout::HorizontalBgr;
+    }
+    if input.just_pressed(KeyCode::KeyV) {
+        *layout = SubpixelLcdLayout::VerticalRgb;
+    }
+    if input.just_pressed(KeyCode::KeyG) {
+        *layout = SubpixelLcdLayout::VerticalBgr;
+    }
+
+    // Screenshot. Save under `/tmp` with a unix-millisecond suffix so
+    // repeat presses don't clobber each other.
+    if input.just_pressed(KeyCode::KeyS) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = format!("/tmp/text_subpixel_{stamp}.png");
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+    }
+}
+
+fn update_hud(
+    settings: Res<SubpixelTextSettings>,
+    layout: Res<SubpixelLcdLayout>,
+    mut hud: Query<&mut Text, With<HudText>>,
+) {
+    // Only rewrite the HUD when something changed; `Res::is_changed` covers
+    // the env-var, startup, and keypress-induced edits.
+    if !settings.is_changed() && !layout.is_changed() {
+        return;
+    }
+    let Ok(mut text) = hud.single_mut() else {
+        return;
+    };
+    let layout_name = match *layout {
+        SubpixelLcdLayout::HorizontalRgb => "HorizontalRgb",
+        SubpixelLcdLayout::HorizontalBgr => "HorizontalBgr",
+        SubpixelLcdLayout::VerticalRgb => "VerticalRgb",
+        SubpixelLcdLayout::VerticalBgr => "VerticalBgr",
+    };
+    **text = format!(
+        "contrast: {:.2}  layout: {}\n[1/2/3] contrast   [R/B/V/G] layout   [S] screenshot",
+        settings.enhanced_contrast, layout_name,
+    );
 }
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
@@ -256,4 +369,24 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                 });
             }
         });
+
+    // HUD in the top-right corner. Uses absolute positioning so it floats over
+    // the grid without reflowing the existing layout.
+    commands.spawn((
+        HudText,
+        Text::new("contrast: 0.50  layout: HorizontalRgb\n[1/2/3] contrast   [R/B/V/G] layout   [S] screenshot"),
+        TextFont {
+            font: mono_font.clone(),
+            font_size: 11.0,
+            font_smoothing: FontSmoothing::AntiAliased,
+            ..default()
+        },
+        TextColor(Color::srgb(0.85, 0.85, 0.60)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(8),
+            right: px(12),
+            ..default()
+        },
+    ));
 }

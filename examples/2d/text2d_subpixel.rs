@@ -7,8 +7,8 @@
 //! one per [`FontSmoothing`] variant, at four realistic body sizes.
 //!
 //! On an adapter that supports `wgpu::Features::DUAL_SOURCE_BLENDING` (Metal,
-//! Vulkan on most modern GPUs, DX12), the SubpixelAntiAliased column should
-//! look visibly sharper than the AntiAliased column at 10pt and 14pt —
+//! Vulkan on most modern GPUs, DX12), the `SubpixelAntiAliased` column should
+//! look visibly sharper than the `AntiAliased` column at 10pt and 14pt —
 //! particularly on the vertical stems of `l`, `i`, `k`, `b`, on the round
 //! strokes of digits, and on the small punctuation in the code snippet. On
 //! adapters without DSB the subpixel column transparently falls back to
@@ -64,13 +64,13 @@ fn main() {
 
     // Optional override of `SubpixelTextSettings::enhanced_contrast` for
     // demonstrating the tunable.
-    if let Ok(raw) = std::env::var("BEVY_TEXT_SUBPIXEL_ENHANCED_CONTRAST") {
-        if let Ok(value) = raw.trim().parse::<f32>() {
-            app.insert_resource(SubpixelTextSettings {
-                enhanced_contrast: value,
-                ..Default::default()
-            });
-        }
+    if let Ok(raw) = std::env::var("BEVY_TEXT_SUBPIXEL_ENHANCED_CONTRAST")
+        && let Ok(value) = raw.trim().parse::<f32>()
+    {
+        app.insert_resource(SubpixelTextSettings {
+            enhanced_contrast: value,
+            ..Default::default()
+        });
     }
 
     // Optional override of `SubpixelLcdLayout`.
@@ -130,8 +130,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     // Compute the top-left origin of the triptych grid in world space. With
     // `Camera2d`'s default transform, the origin (0, 0) is the center of the
     // screen; positive y is up. We lay out rows top-to-bottom.
-    let total_width = CELL_WIDTH * SMOOTHINGS.len() as f32
-        + CELL_GAP_X * (SMOOTHINGS.len() as f32 - 1.0);
+    let total_width =
+        CELL_WIDTH * SMOOTHINGS.len() as f32 + CELL_GAP_X * (SMOOTHINGS.len() as f32 - 1.0);
     let grid_left = -total_width * 0.5;
     let header_height = 36.0;
     let caption_height = 28.0;
@@ -160,8 +160,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     // Column headers.
     let header_y = grid_top - caption_height - header_height * 0.5;
     for (col, (_, label)) in SMOOTHINGS.iter().enumerate() {
-        let cell_center_x = grid_left + CELL_WIDTH * 0.5
-            + col as f32 * (CELL_WIDTH + CELL_GAP_X);
+        let cell_center_x = grid_left + CELL_WIDTH * 0.5 + col as f32 * (CELL_WIDTH + CELL_GAP_X);
         commands.spawn((
             Text2d::new(format!("FontSmoothing::{label}")),
             TextFont {
@@ -180,8 +179,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     for (row, size) in SIZES.iter().enumerate() {
         let cell_top = body_top - row as f32 * (CELL_HEIGHT + ROW_GAP_Y);
         for (col, (smoothing, _)) in SMOOTHINGS.iter().enumerate() {
-            let cell_center_x = grid_left + CELL_WIDTH * 0.5
-                + col as f32 * (CELL_WIDTH + CELL_GAP_X);
+            let cell_center_x =
+                grid_left + CELL_WIDTH * 0.5 + col as f32 * (CELL_WIDTH + CELL_GAP_X);
 
             // Size badge (top of the cell).
             commands.spawn((
@@ -193,11 +192,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 },
                 TextColor(Color::srgb(0.45, 0.45, 0.45)),
-                Transform::from_xyz(
-                    cell_center_x,
-                    cell_top - SAMPLE_LINE_HEIGHT * 0.5,
-                    0.0,
-                ),
+                Transform::from_xyz(cell_center_x, cell_top - SAMPLE_LINE_HEIGHT * 0.5, 0.0),
             ));
 
             // Prose (sans).
@@ -210,11 +205,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 },
                 TextColor(Color::WHITE),
-                Transform::from_xyz(
-                    cell_center_x,
-                    cell_top - SAMPLE_LINE_HEIGHT * 1.5,
-                    0.0,
-                ),
+                Transform::from_xyz(cell_center_x, cell_top - SAMPLE_LINE_HEIGHT * 1.5, 0.0),
             ));
 
             // Code (mono).
@@ -227,11 +218,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 },
                 TextColor(Color::srgb(0.90, 0.90, 0.78)),
-                Transform::from_xyz(
-                    cell_center_x,
-                    cell_top - SAMPLE_LINE_HEIGHT * 2.5,
-                    0.0,
-                ),
+                Transform::from_xyz(cell_center_x, cell_top - SAMPLE_LINE_HEIGHT * 2.5, 0.0),
             ));
 
             // Digits (mono).
@@ -244,11 +231,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 },
                 TextColor(Color::srgb(0.78, 0.88, 1.0)),
-                Transform::from_xyz(
-                    cell_center_x,
-                    cell_top - SAMPLE_LINE_HEIGHT * 3.5,
-                    0.0,
-                ),
+                Transform::from_xyz(cell_center_x, cell_top - SAMPLE_LINE_HEIGHT * 3.5, 0.0),
             ));
         }
     }

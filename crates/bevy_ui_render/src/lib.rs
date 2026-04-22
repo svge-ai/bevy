@@ -212,7 +212,7 @@ pub fn init_ui_subpixel_capability(mut commands: Commands, render_device: Res<Re
 }
 
 /// GPU-facing form of [`SubpixelTextSettings`] and [`SubpixelLcdLayout`],
-/// written each frame into [`UiMeta::subpixel_settings`](UiMeta) and bound
+/// written each frame into [`UiMeta`]'s `subpixel_settings` field and bound
 /// as `@group(0) @binding(1)` of the UI view bind group.
 ///
 /// `std140` layout notes:
@@ -254,8 +254,8 @@ impl From<(&SubpixelTextSettings, SubpixelLcdLayout)> for SubpixelTextUniforms {
 }
 
 /// Copies [`SubpixelTextSettings`] and [`SubpixelLcdLayout`] from the main
-/// world into [`UiMeta::subpixel_settings`] each frame. Runs in
-/// [`ExtractSchedule`]. The resource is cheap (32 bytes) so we unconditionally
+/// world into [`UiMeta`]'s `subpixel_settings` field each frame. Runs in
+/// `ExtractSchedule`. The resource is cheap (32 bytes) so we unconditionally
 /// copy even when subpixel rendering is inactive — keeps the view bind group
 /// layout stable across both pipeline variants.
 pub fn extract_subpixel_text_settings(

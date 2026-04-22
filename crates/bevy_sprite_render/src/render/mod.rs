@@ -103,7 +103,7 @@ pub fn init_sprite_pipeline(mut commands: Commands, asset_server: Res<AssetServe
 
 /// GPU-facing form of [`bevy_text::SubpixelTextSettings`] and
 /// [`bevy_text::SubpixelLcdLayout`], written each frame into
-/// [`SpriteMeta::subpixel_settings`] and bound as `@group(0) @binding(3)` of
+/// `SpriteMeta::subpixel_settings` and bound as `@group(0) @binding(3)` of
 /// the sprite view bind group.
 ///
 /// Duplicated from `bevy_ui_render::SubpixelTextUniforms` — each render crate
@@ -182,8 +182,8 @@ pub fn init_sprite_subpixel_capability(mut commands: Commands, render_device: Re
 }
 
 /// Copies [`SubpixelTextSettings`] and [`SubpixelLcdLayout`] from the main
-/// world into [`SpriteMeta::subpixel_settings`] each frame. Runs in
-/// [`ExtractSchedule`]. The resource is cheap (32 bytes) so we unconditionally
+/// world into `SpriteMeta::subpixel_settings` each frame. Runs in
+/// `ExtractSchedule`. The resource is cheap (32 bytes) so we unconditionally
 /// copy even when no subpixel sprites are queued — keeps the view bind group
 /// layout stable across both pipeline variants.
 #[cfg(feature = "bevy_text")]
