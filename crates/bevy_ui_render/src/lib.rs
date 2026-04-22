@@ -39,7 +39,7 @@ use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
-use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2, Vec3, Vec4};
+use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2, Vec4};
 use bevy_render::{
     render_asset::RenderAssets,
     render_graph::{Node as RenderGraphNode, NodeRunError, RenderGraph, RenderGraphContext},
@@ -246,46 +246,127 @@ impl Default for SubpixelTextSettings {
     }
 }
 
-/// GPU-facing form of [`SubpixelTextSettings`], written each frame into
-/// [`UiMeta::subpixel_settings`](UiMeta) and bound as `@group(0) @binding(1)`
-/// of the UI view bind group. `_pad` preserves `std140` 16-byte alignment
-/// between the scalar `enhanced_contrast` and the `vec4<f32> gamma_ratios`.
+/// Subpixel arrangement of the target LCD panel.
+///
+/// Defaults to [`SubpixelLcdLayout::HorizontalRgb`] — the arrangement of
+/// ~99% of desktop LCDs and nearly all laptop panels. Override for BGR
+/// panels (some older displays) or rotated portrait displays.
+///
+/// Only consulted when [`FontSmoothing::SubpixelAntiAliased`] is active and
+/// [`UiSubpixelCapable`] is `true`. Automatic detection of the host panel's
+/// layout is deliberately out of scope — each platform's API is fiddly
+/// enough to be its own future spec.
+///
+/// # Limitations of the vertical variants
+///
+/// The glyph atlas is produced by
+/// `bevy_text::font_atlas::rasterise_subpixel_glyph`, which invokes `swash`
+/// with [`Format::Subpixel`](https://docs.rs/swash/latest/swash/zeno/enum.Format.html).
+/// swash emits three coverage values *per logical pixel*, pre-offset along
+/// the horizontal subpixel stripe. The atlas therefore already encodes the
+/// R-at-left / G-at-center / B-at-right geometry.
+///
+/// For [`SubpixelLcdLayout::HorizontalRgb`] the shader samples and emits the
+/// atlas RGB as-is. For [`SubpixelLcdLayout::HorizontalBgr`] the shader
+/// swizzles to `.bgr`, which inverts the colour-fringe direction — on a
+/// physically BGR panel this yields correct subpixel antialiasing.
+///
+/// The vertical variants ([`SubpixelLcdLayout::VerticalRgb`] /
+/// [`SubpixelLcdLayout::VerticalBgr`]) are wired through the same uniform so
+/// apps can toggle them, but correct vertical-subpixel antialiasing would
+/// require re-rasterising the glyph with a rotated subpixel direction — the
+/// current atlas is horizontally pre-offset and cannot be re-used. With this
+/// phase they still produce distinct output from `HorizontalRgb` (proof of
+/// wiring), but aren't actually correct on a vertical-subpixel panel. A
+/// follow-up spec can either rotate the sample pattern at rasterisation
+/// time or maintain a second vertical-subpixel atlas.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubpixelLcdLayout {
+    /// Red at left, green centered, blue at right. Default and most common.
+    #[default]
+    HorizontalRgb,
+    /// Blue at left, green centered, red at right. Some older displays.
+    HorizontalBgr,
+    /// Red at top, green centered, blue at bottom. See type-level note —
+    /// requires a rasteriser change to be visually correct; currently acts
+    /// as a proof-of-wiring knob only.
+    VerticalRgb,
+    /// Blue at top, green centered, red at bottom. See type-level note —
+    /// requires a rasteriser change to be visually correct.
+    VerticalBgr,
+}
+
+impl SubpixelLcdLayout {
+    /// Matches the discriminants consumed by `ui.wgsl`'s subpixel fragment
+    /// entry. Keep the numeric values in sync with the `LAYOUT_*` constants
+    /// declared in the shader.
+    pub(crate) fn shader_flags(self) -> u32 {
+        match self {
+            SubpixelLcdLayout::HorizontalRgb => 0,
+            SubpixelLcdLayout::HorizontalBgr => 1,
+            SubpixelLcdLayout::VerticalRgb => 2,
+            SubpixelLcdLayout::VerticalBgr => 3,
+        }
+    }
+}
+
+/// GPU-facing form of [`SubpixelTextSettings`] and [`SubpixelLcdLayout`],
+/// written each frame into [`UiMeta::subpixel_settings`](UiMeta) and bound
+/// as `@group(0) @binding(1)` of the UI view bind group.
+///
+/// `std140` layout notes:
+/// - `enhanced_contrast: f32` (offset 0) + `layout_flags: u32` (offset 4)
+///   pack into the first 8 bytes of the leading 16-byte slot.
+/// - `_pad: Vec2` (offset 8) fills the rest of that 16-byte slot so the
+///   trailing `vec4<f32> gamma_ratios` lands on its required 16-byte boundary.
+///
+/// Total: 32 bytes, unchanged from phase-01.
 #[derive(ShaderType, Clone, Copy, Debug)]
 pub struct SubpixelTextUniforms {
     pub enhanced_contrast: f32,
-    pub _pad: Vec3,
+    /// LCD layout discriminant (see [`SubpixelLcdLayout::shader_flags`]).
+    /// Consumed by `ui.wgsl`'s `fragment_subpixel` to pick the RGB-channel
+    /// swizzle for the panel's subpixel arrangement.
+    pub layout_flags: u32,
+    pub _pad: Vec2,
     pub gamma_ratios: Vec4,
 }
 
 impl Default for SubpixelTextUniforms {
     fn default() -> Self {
-        Self::from(&SubpixelTextSettings::default())
+        Self::from((
+            &SubpixelTextSettings::default(),
+            SubpixelLcdLayout::default(),
+        ))
     }
 }
 
-impl From<&SubpixelTextSettings> for SubpixelTextUniforms {
-    fn from(settings: &SubpixelTextSettings) -> Self {
+impl From<(&SubpixelTextSettings, SubpixelLcdLayout)> for SubpixelTextUniforms {
+    fn from((settings, layout): (&SubpixelTextSettings, SubpixelLcdLayout)) -> Self {
         Self {
             enhanced_contrast: settings.enhanced_contrast,
-            _pad: Vec3::ZERO,
+            layout_flags: layout.shader_flags(),
+            _pad: Vec2::ZERO,
             gamma_ratios: settings.gamma_ratios,
         }
     }
 }
 
-/// Copies [`SubpixelTextSettings`] from the main world into
-/// [`UiMeta::subpixel_settings`] each frame. Runs in
+/// Copies [`SubpixelTextSettings`] and [`SubpixelLcdLayout`] from the main
+/// world into [`UiMeta::subpixel_settings`] each frame. Runs in
 /// [`ExtractSchedule`]. The resource is cheap (32 bytes) so we unconditionally
 /// copy even when subpixel rendering is inactive — keeps the view bind group
 /// layout stable across both pipeline variants.
 pub fn extract_subpixel_text_settings(
     settings: Extract<Res<SubpixelTextSettings>>,
+    layout: Extract<Res<SubpixelLcdLayout>>,
     mut ui_meta: ResMut<UiMeta>,
 ) {
     let settings: &SubpixelTextSettings = &settings;
+    let layout: SubpixelLcdLayout = **layout;
     ui_meta
         .subpixel_settings
-        .set(SubpixelTextUniforms::from(settings));
+        .set(SubpixelTextUniforms::from((settings, layout)));
 }
 
 /// Number of shadow samples.
@@ -323,10 +404,12 @@ impl Plugin for UiRenderPlugin {
         load_shader_library!(app, "ui.wgsl");
 
         // Installed on the main app so `app.insert_resource(SubpixelTextSettings { .. })`
-        // works without needing to reach into the render sub-app. The render
-        // app mirrors the value into a uniform each frame via
+        // or `app.insert_resource(SubpixelLcdLayout::HorizontalBgr)` works
+        // without needing to reach into the render sub-app. The render app
+        // mirrors both values into a shared uniform each frame via
         // `extract_subpixel_text_settings`.
         app.init_resource::<SubpixelTextSettings>();
+        app.init_resource::<SubpixelLcdLayout>();
 
         #[cfg(feature = "bevy_ui_debug")]
         app.init_resource::<UiDebugOptions>();

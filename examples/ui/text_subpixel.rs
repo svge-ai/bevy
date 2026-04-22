@@ -18,7 +18,7 @@
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::text::FontSmoothing;
-use bevy::ui_render::SubpixelTextSettings;
+use bevy::ui_render::{SubpixelLcdLayout, SubpixelTextSettings};
 
 /// Prose sample — one line of English at four sizes exercises most of the
 /// Latin lowercase and caps.
@@ -58,6 +58,25 @@ fn main() {
                 enhanced_contrast: value,
                 ..Default::default()
             });
+        }
+    }
+
+    // Optional override of `SubpixelLcdLayout` for demonstrating the layout
+    // knob. Parse `BEVY_TEXT_SUBPIXEL_LCD_LAYOUT` as one of
+    // `horizontal-rgb` / `horizontal-bgr` / `vertical-rgb` / `vertical-bgr`
+    // (case-insensitive, `-` or `_` separator tolerated). Missing or
+    // unrecognised values fall back to the default `HorizontalRgb`.
+    if let Ok(raw) = std::env::var("BEVY_TEXT_SUBPIXEL_LCD_LAYOUT") {
+        let normalised = raw.trim().to_ascii_lowercase().replace('_', "-");
+        let layout = match normalised.as_str() {
+            "horizontal-rgb" | "hrgb" | "rgb" => Some(SubpixelLcdLayout::HorizontalRgb),
+            "horizontal-bgr" | "hbgr" | "bgr" => Some(SubpixelLcdLayout::HorizontalBgr),
+            "vertical-rgb" | "vrgb" => Some(SubpixelLcdLayout::VerticalRgb),
+            "vertical-bgr" | "vbgr" => Some(SubpixelLcdLayout::VerticalBgr),
+            _ => None,
+        };
+        if let Some(layout) = layout {
+            app.insert_resource(layout);
         }
     }
 

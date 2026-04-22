@@ -29,18 +29,34 @@ fn enabled(flags: u32, mask: u32) -> bool {
 @group(0) @binding(0) var<uniform> view: View;
 
 // Tuning parameters for `fragment_subpixel`, populated from the
-// `SubpixelTextSettings` resource by `extract_subpixel_text_settings` in
-// `bevy_ui_render/src/lib.rs`. Declared on every UI pipeline variant — even
-// the non-subpixel entry points — so the view bind group layout is shared.
-// The non-subpixel `fragment` entry simply doesn't reference this.
+// `SubpixelTextSettings` and `SubpixelLcdLayout` resources by
+// `extract_subpixel_text_settings` in `bevy_ui_render/src/lib.rs`. Declared on
+// every UI pipeline variant — even the non-subpixel entry points — so the
+// view bind group layout is shared. The non-subpixel `fragment` entry simply
+// doesn't reference this.
+//
+// `layout_flags` discriminant (keep in sync with `SubpixelLcdLayout` in
+// `lib.rs`):
+//   0 = HorizontalRgb  (atlas R, G, B in that order — identity swizzle)
+//   1 = HorizontalBgr  (swap R/B — text on a BGR panel)
+//   2 = VerticalRgb    (proof-of-wiring; see vertical-limitation note below)
+//   3 = VerticalBgr    (proof-of-wiring)
 struct SubpixelSettings {
     enhanced_contrast: f32,
+    layout_flags: u32,
     // Explicit padding matches the Rust `SubpixelTextUniforms::_pad` so the
     // `vec4<f32>` below lands on a 16-byte boundary per std140 rules.
-    _pad: vec3<f32>,
+    // `enhanced_contrast` (4 bytes) + `layout_flags` (4 bytes) + `_pad`
+    // (8 bytes) fills the leading 16-byte slot.
+    _pad: vec2<f32>,
     gamma_ratios: vec4<f32>,
 }
 @group(0) @binding(1) var<uniform> subpixel_settings: SubpixelSettings;
+
+const SUBPIXEL_LAYOUT_HORIZONTAL_RGB: u32 = 0u;
+const SUBPIXEL_LAYOUT_HORIZONTAL_BGR: u32 = 1u;
+const SUBPIXEL_LAYOUT_VERTICAL_RGB: u32 = 2u;
+const SUBPIXEL_LAYOUT_VERTICAL_BGR: u32 = 3u;
 
 struct VertexOutput {
     @location(0) uv: vec2<f32>,
@@ -308,10 +324,38 @@ fn apply_contrast_and_gamma_correction3(
     return apply_alpha_correction3(contrasted, fg, gamma_ratios);
 }
 
+// Remap the atlas's three per-channel coverage values to match the target
+// panel's physical subpixel arrangement (see `SubpixelLcdLayout` in `lib.rs`).
+//
+// The swash rasteriser (`bevy_text::font_atlas::rasterise_subpixel_glyph`) emits
+// the atlas with *horizontal RGB* pre-offset baked in: texel `(x, y).r` is
+// already the left subpixel's coverage at logical pixel `(x, y)`, `.g` the
+// centre, `.b` the right. We therefore only need to swizzle — not resample at
+// offset UVs — to support BGR panels.
+//
+// The vertical variants have no correct remap available from a
+// horizontally-offset atlas. They currently swap R/B (mirroring the horizontal
+// BGR/RGB distinction) so the setting visibly affects output, but the result
+// is *not* a correct vertical-subpixel antialiasing; a follow-up spec will add
+// vertical-subpixel rasterisation and re-wire these variants.
+fn swizzle_subpixel_atlas(atlas_rgb: vec3<f32>, layout_flags: u32) -> vec3<f32> {
+    if layout_flags == SUBPIXEL_LAYOUT_HORIZONTAL_BGR
+        || layout_flags == SUBPIXEL_LAYOUT_VERTICAL_BGR
+    {
+        return atlas_rgb.bgr;
+    }
+    return atlas_rgb;
+}
+
 @fragment
 fn fragment_subpixel(in: VertexOutput) -> SubpixelOutput {
-    // Sample three per-channel alpha coverages from the RGB subpixel atlas.
-    let sample_rgb = textureSample(sprite_texture, sprite_sampler, in.uv).rgb;
+    // Sample three per-channel alpha coverages from the RGB subpixel atlas,
+    // then swizzle by the panel's subpixel layout. The swash rasteriser has
+    // already baked in horizontal per-channel UV offsets, so a single sample
+    // plus a swizzle is both correct and optimal for `HorizontalRgb` /
+    // `HorizontalBgr`. See `swizzle_subpixel_atlas` for the vertical caveat.
+    let atlas_rgb = textureSample(sprite_texture, sprite_sampler, in.uv).rgb;
+    let sample_rgb = swizzle_subpixel_atlas(atlas_rgb, subpixel_settings.layout_flags);
 
     // Tuning parameters come from the `SubpixelSettings` uniform (bound at
     // `@group(0) @binding(1)`), populated each frame from
