@@ -21,7 +21,8 @@
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-use bevy::text::{FontSmoothing, SubpixelLcdLayout, SubpixelTextSettings};
+use bevy::text::{FontSmoothing, SubpixelLcdLayout, SubpixelTextSettings, TextBounds};
+use bevy::window::WindowResolution;
 
 /// Prose sample — one line of English at four sizes exercises most of the
 /// Latin lowercase and caps.
@@ -50,15 +51,44 @@ const SMOOTHINGS: [(FontSmoothing, &str); 3] = [
 const CELL_WIDTH: f32 = 360.0;
 const CELL_GAP_X: f32 = 16.0;
 const ROW_GAP_Y: f32 = 12.0;
-// Within a cell, this much vertical space is reserved per text sample. Wide
-// enough for 32pt with extra leading; smaller sizes leave blank space.
-const SAMPLE_LINE_HEIGHT: f32 = 40.0;
-// 4 samples per cell: size badge + 3 body samples. Padded.
-const CELL_HEIGHT: f32 = SAMPLE_LINE_HEIGHT * 4.0 + 24.0;
+// Horizontal inset from the cell edge to the text bounds. Mirrors the UI
+// sibling's 8px cell padding so body text wraps at the same column width
+// instead of overflowing into the neighbouring cell at 20pt / 32pt.
+const CELL_PADDING_X: f32 = 8.0;
+const TEXT_BOUNDS_WIDTH: f32 = CELL_WIDTH - CELL_PADDING_X * 2.0;
+// Reserved vertical space for the fixed 11pt size badge at the top of each
+// cell. Matches the smaller per-row sample spacing at the 10pt row.
+const BADGE_LINE_HEIGHT: f32 = 24.0;
+
+// Per-row vertical space reserved for each of the three body samples (prose,
+// code, digits) at `size`. Big enough for two wrapped lines at that size plus
+// breathing room, so 20pt and 32pt prose / code / digits that wrap don't bleed
+// into the next sample. Smaller sizes leave extra blank space, mirroring the
+// UI sibling where flex rows grow with content.
+fn sample_line_height(size: f32) -> f32 {
+    // Two lines of `size` at 1.2 leading, plus 12 units of row padding.
+    (size * 1.2 * 2.0 + 12.0).max(40.0)
+}
+
+fn cell_height(size: f32) -> f32 {
+    BADGE_LINE_HEIGHT + sample_line_height(size) * 3.0 + 12.0
+}
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins)
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        // Tall enough to fit 4 rows at per-row heights scaled to 32pt without
+        // the 32pt row running off the bottom of the viewport. The UI sibling
+        // gets away with 1280x720 because its flex row heights compress to the
+        // cell's allocated slice; `Text2d` is absolute-positioned, so the cells
+        // need room to actually be as tall as their wrapped content.
+        primary_window: Some(Window {
+            resolution: WindowResolution::new(1280, 1040),
+            title: "text2d_subpixel".into(),
+            ..default()
+        }),
+        ..default()
+    }))
         .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.08)))
         .add_systems(Startup, setup);
 
@@ -135,9 +165,10 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let grid_left = -total_width * 0.5;
     let header_height = 36.0;
     let caption_height = 28.0;
+    let cells_total_height: f32 = SIZES.iter().map(|s| cell_height(*s)).sum();
     let total_height = caption_height
         + header_height
-        + CELL_HEIGHT * SIZES.len() as f32
+        + cells_total_height
         + ROW_GAP_Y * (SIZES.len() as f32 - 1.0);
     let grid_top = total_height * 0.5;
 
@@ -174,14 +205,18 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         ));
     }
 
-    // Body cells.
+    // Body cells. Each row's height scales with its font size so wrapped
+    // prose / code / digits at 20pt and 32pt have enough vertical room and
+    // do not overlap the sample below.
     let body_top = header_y - header_height * 0.5;
-    for (row, size) in SIZES.iter().enumerate() {
-        let cell_top = body_top - row as f32 * (CELL_HEIGHT + ROW_GAP_Y);
+    let mut cell_top = body_top;
+    for (_row, size) in SIZES.iter().enumerate() {
+        let sample_h = sample_line_height(*size);
+        let cell_h = cell_height(*size);
         for (col, (smoothing, _)) in SMOOTHINGS.iter().enumerate() {
             let cell_center_x =
                 grid_left + CELL_WIDTH * 0.5 + col as f32 * (CELL_WIDTH + CELL_GAP_X);
-            let cell_center_y = cell_top - CELL_HEIGHT * 0.5;
+            let cell_center_y = cell_top - cell_h * 0.5;
 
             // Cell border (outer rectangle, 1px larger on each side).
             // Colors match the `text_subpixel` UI example's border/background
@@ -192,7 +227,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             commands.spawn((
                 Sprite {
                     color: Color::srgb(0.22, 0.22, 0.22),
-                    custom_size: Some(Vec2::new(CELL_WIDTH + 2.0, CELL_HEIGHT + 2.0)),
+                    custom_size: Some(Vec2::new(CELL_WIDTH + 2.0, cell_h + 2.0)),
                     ..default()
                 },
                 Transform::from_xyz(cell_center_x, cell_center_y, -0.2),
@@ -201,7 +236,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             commands.spawn((
                 Sprite {
                     color: Color::BLACK,
-                    custom_size: Some(Vec2::new(CELL_WIDTH, CELL_HEIGHT)),
+                    custom_size: Some(Vec2::new(CELL_WIDTH, cell_h)),
                     ..default()
                 },
                 Transform::from_xyz(cell_center_x, cell_center_y, -0.1),
@@ -217,8 +252,10 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 },
                 TextColor(Color::srgb(0.45, 0.45, 0.45)),
-                Transform::from_xyz(cell_center_x, cell_top - SAMPLE_LINE_HEIGHT * 0.5, 0.0),
+                Transform::from_xyz(cell_center_x, cell_top - BADGE_LINE_HEIGHT * 0.5, 0.0),
             ));
+
+            let body_origin_y = cell_top - BADGE_LINE_HEIGHT;
 
             // Prose (sans).
             commands.spawn((
@@ -230,7 +267,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 },
                 TextColor(Color::WHITE),
-                Transform::from_xyz(cell_center_x, cell_top - SAMPLE_LINE_HEIGHT * 1.5, 0.0),
+                TextBounds::new_horizontal(TEXT_BOUNDS_WIDTH),
+                Transform::from_xyz(cell_center_x, body_origin_y - sample_h * 0.5, 0.0),
             ));
 
             // Code (mono).
@@ -243,7 +281,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 },
                 TextColor(Color::srgb(0.90, 0.90, 0.78)),
-                Transform::from_xyz(cell_center_x, cell_top - SAMPLE_LINE_HEIGHT * 2.5, 0.0),
+                TextBounds::new_horizontal(TEXT_BOUNDS_WIDTH),
+                Transform::from_xyz(cell_center_x, body_origin_y - sample_h * 1.5, 0.0),
             ));
 
             // Digits (mono).
@@ -256,8 +295,10 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 },
                 TextColor(Color::srgb(0.78, 0.88, 1.0)),
-                Transform::from_xyz(cell_center_x, cell_top - SAMPLE_LINE_HEIGHT * 3.5, 0.0),
+                TextBounds::new_horizontal(TEXT_BOUNDS_WIDTH),
+                Transform::from_xyz(cell_center_x, body_origin_y - sample_h * 2.5, 0.0),
             ));
         }
+        cell_top -= cell_h + ROW_GAP_Y;
     }
 }
