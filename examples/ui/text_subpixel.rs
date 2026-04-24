@@ -308,6 +308,20 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                                 flex_direction: FlexDirection::Column,
                                 flex_grow: 1.0,
                                 flex_basis: percent(0),
+                                flex_shrink: 1.0,
+                                // FontSmoothing::None rasterises glyphs with
+                                // pixel-hard advances that can exceed the
+                                // cell's 1/3 flex share. Without clamping
+                                // `min_width` to zero, flex's default
+                                // `min_width: auto` uses content size as the
+                                // minimum and pushes the cell wider than its
+                                // share -- dropping the right border off the
+                                // visible area. Clip overflow so glyphs that
+                                // still exceed the cell don't bleed into
+                                // siblings.
+                                min_width: px(0),
+                                width: percent(100),
+                                overflow: Overflow::clip(),
                                 row_gap: px(2),
                                 padding: UiRect::all(px(8)),
                                 border: UiRect::all(px(1)),

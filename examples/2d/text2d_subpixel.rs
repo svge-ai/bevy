@@ -181,6 +181,31 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         for (col, (smoothing, _)) in SMOOTHINGS.iter().enumerate() {
             let cell_center_x =
                 grid_left + CELL_WIDTH * 0.5 + col as f32 * (CELL_WIDTH + CELL_GAP_X);
+            let cell_center_y = cell_top - CELL_HEIGHT * 0.5;
+
+            // Cell border (outer rectangle, 1px larger on each side).
+            // Colors match the `text_subpixel` UI example's border/background
+            // so the two examples read as visually consistent. Both sprites
+            // sit at negative z so Text2d entities (default z=0) render on
+            // top. Larger z renders on top in bevy_sprite, so z=-0.2 is
+            // behind z=-0.1 which is behind z=0.
+            commands.spawn((
+                Sprite {
+                    color: Color::srgb(0.18, 0.18, 0.18),
+                    custom_size: Some(Vec2::new(CELL_WIDTH + 2.0, CELL_HEIGHT + 2.0)),
+                    ..default()
+                },
+                Transform::from_xyz(cell_center_x, cell_center_y, -0.2),
+            ));
+            // Cell background (inner rectangle, exactly cell-sized).
+            commands.spawn((
+                Sprite {
+                    color: Color::srgb(0.04, 0.04, 0.04),
+                    custom_size: Some(Vec2::new(CELL_WIDTH, CELL_HEIGHT)),
+                    ..default()
+                },
+                Transform::from_xyz(cell_center_x, cell_center_y, -0.1),
+            ));
 
             // Size badge (top of the cell).
             commands.spawn((
