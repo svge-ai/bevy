@@ -327,8 +327,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                                 border: UiRect::all(px(1)),
                                 ..default()
                             },
-                            BorderColor::all(Color::srgb(0.18, 0.18, 0.18)),
-                            BackgroundColor(Color::srgb(0.04, 0.04, 0.04)),
+                            BorderColor::all(Color::srgb(0.22, 0.22, 0.22)),
+                            BackgroundColor(Color::BLACK),
                         ))
                         .with_children(|cell| {
                             // Size badge.

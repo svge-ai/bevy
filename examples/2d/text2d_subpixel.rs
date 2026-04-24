@@ -191,7 +191,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             // behind z=-0.1 which is behind z=0.
             commands.spawn((
                 Sprite {
-                    color: Color::srgb(0.18, 0.18, 0.18),
+                    color: Color::srgb(0.22, 0.22, 0.22),
                     custom_size: Some(Vec2::new(CELL_WIDTH + 2.0, CELL_HEIGHT + 2.0)),
                     ..default()
                 },
@@ -200,7 +200,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             // Cell background (inner rectangle, exactly cell-sized).
             commands.spawn((
                 Sprite {
-                    color: Color::srgb(0.04, 0.04, 0.04),
+                    color: Color::BLACK,
                     custom_size: Some(Vec2::new(CELL_WIDTH, CELL_HEIGHT)),
                     ..default()
                 },
