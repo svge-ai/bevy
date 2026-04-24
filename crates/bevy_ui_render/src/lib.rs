@@ -1665,11 +1665,23 @@ pub fn prepare_uinodes(
 
                 let mut existing_batch = batches.last_mut();
 
+                // Start a new batch whenever the image handle changes, including
+                // transitions between textured (font atlas, sprite) and
+                // untextured (`AssetId::default()`) items.
+                //
+                // The prior logic only split on textured-to-different-textured,
+                // letting untextured nodes inherit the existing batch's bound
+                // texture. That was an intentional optimisation -- the shader's
+                // `TEXTURED` flag tells it to ignore the sample on untextured
+                // quads -- but it meant cell backgrounds/borders drawn in the
+                // middle of a glyph batch got the font atlas bound in their
+                // bind group. On some Vulkan/Metal drivers (AMD RADV, Apple M)
+                // the atlas texels leaked through as "ghost glyph" fragments
+                // visible at the cell's left margin in the upstream
+                // `text_subpixel` example.
                 if batch_image_handle == AssetId::invalid()
                     || existing_batch.is_none()
-                    || (batch_image_handle != AssetId::default()
-                        && extracted_uinode.image != AssetId::default()
-                        && batch_image_handle != extracted_uinode.image)
+                    || batch_image_handle != extracted_uinode.image
                 {
                     if let Some(gpu_image) = gpu_images.get(extracted_uinode.image) {
                         batch_item_index = item_index;

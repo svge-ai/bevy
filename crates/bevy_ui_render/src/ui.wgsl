@@ -252,11 +252,22 @@ fn draw_uinode_background(
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    let texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
-
-    // Only use the color sampled from the texture if the `TEXTURED` flag is enabled.
-    // This allows us to draw both textured and untextured shapes together in the same batch.
-    let color = select(in.color, in.color * texture_color, enabled(in.flags, TEXTURED));
+    // Only sample the texture when the `TEXTURED` flag is set. `in.flags` is
+    // flat-interpolated (provoking-vertex value) so the condition is uniform
+    // across all fragments of a draw call, keeping `textureSample` in uniform
+    // control flow. Previously this sample was unconditional and only its
+    // result was discarded via `select`; that relies on the driver to not
+    // leak the sampled value. On some Vulkan / Metal drivers (AMD RADV/Mesa
+    // and Apple M-series) the leak manifested as "ghost" atlas strips showing
+    // through untextured UI nodes (e.g. cell backgrounds/borders) that were
+    // batched with textured glyph draws for atlas sharing.
+    var color: vec4<f32>;
+    if enabled(in.flags, TEXTURED) {
+        let texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
+        color = in.color * texture_color;
+    } else {
+        color = in.color;
+    }
 
     if enabled(in.flags, BORDER_ANY) {
         return draw_uinode_border(color, in.point, in.size, in.radius, in.border, in.flags);
