@@ -2,7 +2,7 @@ use alloc::borrow::Cow;
 
 use core::hash::BuildHasher;
 
-use bevy_asset::Assets;
+use bevy_asset::{AssetId, Assets, Handle};
 use bevy_color::Color;
 use bevy_ecs::{
     component::Component, entity::Entity, reflect::ReflectComponent, resource::Resource,
@@ -11,6 +11,7 @@ use bevy_ecs::{
 use bevy_image::prelude::*;
 use bevy_log::warn_once;
 use bevy_math::{Rect, Vec2};
+use bevy_platform::collections::HashSet;
 use bevy_platform::hash::FixedHasher;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use parley::style::{OverflowWrap, TextWrapMode, WordBreak};
@@ -319,6 +320,17 @@ impl TextPipeline {
         computed.needs_rerender = false;
         layout_info.clear();
 
+        // svge-main fork (LS-gxrtooro): track atlas AssetIds referenced by
+        // this layout so we can populate `layout_info.atlas_handles` with
+        // deduplicated strong handles at the end. This keeps the
+        // underlying atlas `Image` assets alive for the lifetime of this
+        // `TextLayoutInfo`, which in turn keeps the asset present in
+        // `Assets<Image>` and prevents the weakref-trigger eviction sweep
+        // (`FontAtlasSet::evict_stale`, which checks
+        // `images.contains(atlas.texture)`) from reaping an atlas the
+        // rendering pipeline still needs.
+        let mut referenced_atlas_ids: HashSet<AssetId<Image>> = HashSet::default();
+
         let layout = &mut computed.layout;
         layout_with_bounds(layout, bounds, justify);
 
@@ -374,19 +386,44 @@ impl TextPipeline {
                         };
 
                         let font_atlases = font_atlas_set.entry(font_atlas_key).or_default();
-                        let atlas_info = get_glyph_atlas_info(font_atlases, cache_key)
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                add_glyph_to_atlas(
-                                    font_atlases,
-                                    textures,
-                                    &mut scaler,
-                                    font_smoothing,
-                                    glyph_id,
-                                    subpixel_bucket,
-                                    subpixel_offset,
-                                )
-                            })?;
+                        // svge-main fork (LS-gxrtooro): `add_glyph_to_atlas`
+                        // now returns `(GlyphAtlasInfo, Option<Handle<Image>>)`.
+                        // The `Option<Handle>` is populated only on the
+                        // new-atlas-allocation path; cache hits and slot-fills
+                        // into existing atlases return `None`. Capture the
+                        // handle into `referenced_atlas_ids` via `layout_info`
+                        // promotion below.
+                        let atlas_info = if let Some(info) =
+                            get_glyph_atlas_info(font_atlases, cache_key)
+                        {
+                            info
+                        } else {
+                            let (info, new_handle) = add_glyph_to_atlas(
+                                font_atlases,
+                                textures,
+                                &mut scaler,
+                                font_smoothing,
+                                glyph_id,
+                                subpixel_bucket,
+                                subpixel_offset,
+                            )?;
+                            // Push the strong handle eagerly — the AssetId
+                            // is also captured in `referenced_atlas_ids`
+                            // below, but we can't rely on `get_strong_handle`
+                            // alone because the asset GC drop event for the
+                            // *previous* shape's `atlas_handles` may have
+                            // been queued earlier this frame.
+                            if let Some(handle) = new_handle {
+                                layout_info.atlas_handles.push(handle);
+                            }
+                            info
+                        };
+
+                        // svge-main fork: capture the atlas AssetId for this
+                        // glyph so we can promote it to a strong handle on
+                        // `layout_info.atlas_handles` after the glyph loop.
+                        // Dedup happens via the HashSet.
+                        referenced_atlas_ids.insert(atlas_info.texture);
 
                         let glyph_pos = Vec2::new(glyph.x, glyph.y);
                         let size = atlas_info.rect.size();
@@ -425,6 +462,40 @@ impl TextPipeline {
         }
 
         layout_info.size = Vec2::new(layout.full_width(), layout.height()).ceil();
+
+        // svge-main fork (LS-gxrtooro): promote each referenced atlas
+        // AssetId to a strong `Handle<Image>` and store it on the layout.
+        // These strong handles
+        // (a) keep the atlas `Image` asset alive across frames so the
+        //     renderer can sample it, and
+        // (b) drive weakref-trigger eviction in `FontAtlasSet::evict_stale`:
+        //     when no `TextLayoutInfo` references an atlas any more, the
+        //     atlas's image asset becomes orphaned, the asset GC reaps it,
+        //     and the next eviction sweep notices the missing image
+        //     (via `images.contains`) and drops the now-stale `FontAtlas`.
+        //
+        // Newly-allocated atlas handles were already pushed during the
+        // glyph loop (the strong handle returned from
+        // `add_glyph_to_atlas`); only cache-hit AssetIds need promotion
+        // here. Dedup by skipping AssetIds whose handle was already
+        // pushed — same-frame allocation handles will match the cache-hit
+        // AssetId via `Handle::id()`.
+        let already_pushed: HashSet<AssetId<Image>> = layout_info
+            .atlas_handles
+            .iter()
+            .map(|h| h.id())
+            .collect();
+        for atlas_id in referenced_atlas_ids {
+            if already_pushed.contains(&atlas_id) {
+                continue;
+            }
+            // `get_strong_handle` returns `None` for assets not in the
+            // collection (e.g. UUID-keyed assets, or assets already
+            // dropped). Skip — wouldn't have rendered anyway.
+            if let Some(handle) = textures.get_strong_handle(atlas_id) {
+                layout_info.atlas_handles.push(handle);
+            }
+        }
 
         Ok(())
     }
@@ -496,6 +567,27 @@ pub struct TextLayoutInfo {
     /// Underline rects for the active IME preedit/compose region.
     /// Should only have values when composition is in progress.
     pub preedit_underline_rects: Vec<Rect>,
+    /// svge-main fork (LS-gxrtooro): strong [`Handle<Image>`] per font
+    /// atlas referenced by the glyphs in this layout.
+    ///
+    /// Pre-fix, [`crate::FontAtlas`] held a strong `Handle<Image>` itself,
+    /// and eviction was time-based: shape gating skipped `touch()` on idle
+    /// frames → atlases aged past the idle threshold → evicted while still
+    /// in use → text vanished after 2-3 seconds.
+    ///
+    /// Post-fix, [`crate::FontAtlas`] holds only an [`AssetId<Image>`]
+    /// (weak), and the strong handles for active atlases live HERE,
+    /// per-`TextLayoutInfo`. When a text entity despawns or re-shapes
+    /// with different glyph runs, this `Vec` is replaced; the obsolete
+    /// strong handles drop; if no other layout references the same
+    /// atlases, the asset GC reaps the underlying `Image` at end-of-frame;
+    /// the next [`crate::FontAtlasSet::evict_stale`] sweep notices via
+    /// `Assets::contains` and drops the now-stale [`crate::FontAtlas`].
+    /// No time threshold, no per-frame `touch()` walk required.
+    ///
+    /// `update_text_layout_info` populates this field; consumers do not
+    /// write to it directly.
+    pub atlas_handles: Vec<Handle<Image>>,
 }
 
 impl TextLayoutInfo {
@@ -508,6 +600,10 @@ impl TextLayoutInfo {
         self.cursor = None;
         self.selection_rects.clear();
         self.preedit_underline_rects.clear();
+        // svge-main fork: dropping the strong handles here decreases each
+        // atlas's strong count. The next eviction sweep will reap any atlas
+        // that drops to count == 1 (only the atlas itself owns its handle).
+        self.atlas_handles.clear();
     }
 }
 

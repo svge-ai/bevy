@@ -26,23 +26,43 @@ pub struct FontAtlasKey {
 
 /// Set of rasterized fonts stored in [`FontAtlas`]es.
 ///
-/// # svge-main fork: per-key LRU tracking
+/// # svge-main fork: weakref-trigger eviction
 ///
 /// In addition to the upstream `HashMap<FontAtlasKey, Vec<FontAtlas>>` storage,
-/// this fork tracks `last_used_frames: HashMap<FontAtlasKey, u64>` so that
-/// long-running consumers (such as the liveskill workbench) can periodically
-/// evict atlases for font configurations that haven't been touched in a long
-/// time. The upstream cache has no eviction; without this addition, atlases
-/// for stale themes / DPI-changes / font-size combos accumulate forever and
-/// can OOM apps that run for days or weeks.
+/// long-running consumers (such as the liveskill workbench) need a way to
+/// evict atlases whose underlying `Image` asset is no longer referenced by
+/// any rendered text. The upstream cache has no eviction; without this
+/// addition, atlases for stale themes / DPI-changes / font-size combos
+/// accumulate forever and can OOM apps that run for days.
+///
+/// **Eviction model (LS-gxrtooro):** every [`FontAtlas`] holds a strong
+/// `Handle<Image>` to its atlas image. Live [`crate::TextLayoutInfo`]
+/// instances also hold strong handles (via `atlas_handles`) for the atlases
+/// they reference. [`Self::evict_stale`] walks the cache and reaps any
+/// atlas whose `Arc::strong_count` is exactly 1 — that is, the atlas itself
+/// is the only owner of the image handle, meaning no `TextLayoutInfo`
+/// still references it. When a text entity despawns or re-shapes, its
+/// `atlas_handles` drop, and the next sweep reaps the now-orphaned atlas.
+///
+/// This replaces the original time-based eviction (touch frame stamps +
+/// idle threshold), which had a fatal interaction with shape-gating: gated
+/// systems skip `touch()` on idle frames, so atlases would age past the
+/// threshold and be evicted while still in use.
 ///
 /// Existing read-side API is preserved via `Deref`/`DerefMut` to the inner
 /// atlas map, so callers that only need the atlas storage are unaffected.
-/// New callers that want LRU should call [`Self::touch`] from the lookup
-/// hot path and [`Self::evict_stale`] from a periodic system.
+/// The `touch` / `last_used_frame` API is retained as a no-op and a
+/// frame-stamp readback for backward compat with consumers that already
+/// thread `FrameCount` through `update_text_layout_info` — the actual
+/// eviction trigger no longer reads the timestamps.
 #[derive(Debug, Default, Resource)]
 pub struct FontAtlasSet {
     atlases: HashMap<FontAtlasKey, Vec<FontAtlas>>,
+    /// svge-main fork: kept for backward compat with [`Self::touch`] /
+    /// [`Self::last_used_frame`] callers; not consulted by the eviction
+    /// path any more (which is now weakref-trigger). Will be removed in a
+    /// later cleanup pass once all upstream callers stop threading
+    /// `current_frame` through the public API.
     last_used_frames: HashMap<FontAtlasKey, u64>,
 }
 
@@ -72,7 +92,7 @@ impl FontAtlasSet {
             .flat_map(|font_atlases| font_atlases.iter())
             .map(|font_atlas| {
                 images
-                    .get(&font_atlas.texture)
+                    .get(font_atlas.texture)
                     .and_then(|image| image.data.as_ref())
                     .map_or(0, |data| data.len() as u64)
             })
@@ -95,100 +115,123 @@ impl FontAtlasSet {
         self.last_used_frames.get(key).copied().unwrap_or(0)
     }
 
-    /// svge-main: drop atlases per the given eviction config.
+    /// svge-main fork (LS-gxrtooro): drop atlases whose underlying `Image`
+    /// asset has been reclaimed by the asset GC.
     ///
-    /// Eviction is a two-pass walk:
+    /// Walks every [`FontAtlas`] in the cache. For each atlas, checks
+    /// `images.contains(atlas.texture)`: if `false`, the atlas's `Image`
+    /// has already been reaped (because no [`crate::TextLayoutInfo`] holds
+    /// a strong handle to it any more — the only strong handles to atlas
+    /// images live on `TextLayoutInfo::atlas_handles`). Such atlases are
+    /// stale and are dropped from the cache.
     ///
-    /// 1. **Time-based:** any key whose `last_used_frame` is more than
-    ///    `config.max_idle_frames` older than `current_frame` is dropped
-    ///    (along with all its atlases and the underlying `Image` handles).
-    ///    Set `max_idle_frames = u64::MAX` to disable.
-    /// 2. **Size-based LRU:** if the surviving total atlas memory still
-    ///    exceeds `config.max_total_bytes`, the oldest-touched key is
-    ///    repeatedly evicted until the cap is met. Set `max_total_bytes =
-    ///    u64::MAX` to disable.
+    /// Atlases whose image is still in `Assets<Image>` are kept — at least
+    /// one `TextLayoutInfo` is keeping the strong handle alive, which
+    /// means the renderer may still need this atlas. When that
+    /// `TextLayoutInfo` is replaced (text re-shaped, entity despawned,
+    /// content changed), its handle drops, the asset GC reaps the image
+    /// at end-of-frame, and the next eviction sweep reaps the atlas.
     ///
-    /// Returns the number of `FontAtlasKey` entries removed (not the number
-    /// of individual `FontAtlas` instances — each key may have several).
+    /// `config.max_total_bytes` is a backstop cap. If the surviving atlas
+    /// memory still exceeds the cap after the weakref-trigger pass, the
+    /// largest atlases are dropped — same idea, but ignoring whether the
+    /// image is still reachable (so this can drop in-use atlases under
+    /// genuine memory pressure; size cap defaults are generous).
     ///
-    /// `images` is required because the atlas owns a `Handle<Image>`; the
-    /// underlying `Image` asset must also be removed from the assets
-    /// collection or the texture memory itself wouldn't be reclaimed.
+    /// Returns the number of individual [`FontAtlas`] instances removed.
     pub fn evict_stale(
         &mut self,
-        current_frame: u64,
+        _current_frame: u64,
         config: &FontAtlasEvictionConfig,
         images: &mut Assets<Image>,
     ) -> usize {
         let mut evicted = 0;
 
-        // Pass 1: time-based eviction.
-        if config.max_idle_frames < u64::MAX {
-            let cutoff = current_frame.saturating_sub(config.max_idle_frames);
-            // Collect-then-remove avoids invalidating the iterator over
-            // last_used_frames while we mutate atlases + images.
-            let stale_keys: Vec<FontAtlasKey> = self
-                .last_used_frames
-                .iter()
-                .filter_map(|(k, &frame)| if frame < cutoff { Some(*k) } else { None })
-                .collect();
-            for key in stale_keys {
-                if self.evict_key(&key, images) {
-                    evicted += 1;
-                }
+        // Pass 1: weakref-trigger eviction. An atlas's `texture` is now an
+        // `AssetId<Image>` (no strong reference inside the atlas itself).
+        // The strong handle lives on `TextLayoutInfo::atlas_handles`. When
+        // every `TextLayoutInfo` referencing the atlas drops its handle,
+        // the asset GC removes the `Image` from `Assets<Image>` at
+        // end-of-frame. We notice on the next sweep via `contains()`.
+        let mut empty_keys: Vec<FontAtlasKey> = Vec::new();
+        for (key, atlases) in self.atlases.iter_mut() {
+            let before = atlases.len();
+            atlases.retain(|atlas| images.contains(atlas.texture));
+            evicted += before - atlases.len();
+            if atlases.is_empty() {
+                empty_keys.push(*key);
             }
         }
+        for key in empty_keys {
+            self.atlases.remove(&key);
+            self.last_used_frames.remove(&key);
+        }
 
-        // Pass 2: size-based LRU eviction (drops oldest-touched until under cap).
+        // Pass 2: size-based backstop. If we still exceed the cap, drop the
+        // largest atlas until under it. This intentionally ignores
+        // reachability — once we're over the memory budget, we'd rather
+        // risk a re-rasterise than OOM. With the post-fix model the
+        // in-use atlases will be re-allocated on next shape, with the
+        // strong handle going straight onto the consuming
+        // `TextLayoutInfo`.
         if config.max_total_bytes < u64::MAX {
             loop {
                 let total = self.total_bytes(images);
                 if total <= config.max_total_bytes {
                     break;
                 }
-                let oldest_key = self
-                    .last_used_frames
-                    .iter()
-                    .min_by_key(|&(_, &frame)| frame)
-                    .map(|(k, _)| *k);
-                let Some(key) = oldest_key else {
-                    // No tracked keys remain but bytes still over cap — nothing
-                    // we can do without breaking untracked entries. Bail.
+                // Find the largest atlas across all keys.
+                let mut largest: Option<(FontAtlasKey, usize, u64)> = None;
+                for (key, atlases) in self.atlases.iter() {
+                    for (idx, atlas) in atlases.iter().enumerate() {
+                        let bytes = images
+                            .get(atlas.texture)
+                            .and_then(|img| img.data.as_ref())
+                            .map_or(0, |d| d.len() as u64);
+                        let better = match largest {
+                            None => true,
+                            Some((_, _, prev_bytes)) => bytes > prev_bytes,
+                        };
+                        if better {
+                            largest = Some((*key, idx, bytes));
+                        }
+                    }
+                }
+                let Some((key, idx, _)) = largest else {
                     break;
                 };
-                if !self.evict_key(&key, images) {
-                    // Defensive: if the key vanished mid-iteration, stop to
-                    // avoid an infinite loop.
-                    break;
+                if let Some(atlases) = self.atlases.get_mut(&key) {
+                    if idx < atlases.len() {
+                        let removed = atlases.remove(idx);
+                        // For backstop eviction we ARE responsible for
+                        // removing the asset — the strong handle on
+                        // `TextLayoutInfo` is still keeping the image
+                        // alive, but we've decided to drop it under
+                        // memory pressure.
+                        images.remove(removed.texture);
+                        evicted += 1;
+                    }
+                    if atlases.is_empty() {
+                        self.atlases.remove(&key);
+                        self.last_used_frames.remove(&key);
+                    }
                 }
-                evicted += 1;
             }
         }
 
         evicted
     }
-
-    /// Internal helper: drop a single key's atlases and texture handles.
-    /// Returns `true` if the key was present.
-    fn evict_key(&mut self, key: &FontAtlasKey, images: &mut Assets<Image>) -> bool {
-        let removed = self.atlases.remove(key);
-        self.last_used_frames.remove(key);
-        if let Some(atlases) = removed {
-            for atlas in atlases {
-                images.remove(&atlas.texture);
-            }
-            true
-        } else {
-            false
-        }
-    }
 }
 
-/// svge-main: configuration for [`FontAtlasSet::evict_stale`].
+/// svge-main fork: configuration for [`FontAtlasSet::evict_stale`].
 ///
-/// Default policy is hybrid: evict atlases idle for ≥ 5 minutes at 60 fps
-/// (`60 * 60 * 5` frames) AND cap total atlas memory at 64 MB. Either knob
-/// can be disabled by setting it to `u64::MAX`.
+/// Eviction (LS-gxrtooro) is now weakref-trigger-based: atlases are
+/// reaped when no live [`crate::TextLayoutInfo`] holds a strong handle to
+/// their image. The only configurable knob is a size-based backstop cap
+/// for genuine memory pressure.
+///
+/// Default policy: cap total atlas memory at 64 MB. Set to `u64::MAX` to
+/// disable the backstop entirely (rely solely on weakref eviction).
 ///
 /// Eviction is opt-in: this resource exists in the world only if the consumer
 /// inserts it (and runs a system that calls `evict_stale`). Bevy itself does
@@ -196,22 +239,31 @@ impl FontAtlasSet {
 /// themselves. See `liveskill_ui_render` for the canonical wiring.
 #[derive(Resource, Debug, Clone)]
 pub struct FontAtlasEvictionConfig {
-    /// Atlases not touched in this many frames are evicted. Default:
-    /// `60 * 60 * 5` (~5 minutes at 60 fps). Set to `u64::MAX` to disable
-    /// time-based eviction.
-    pub max_idle_frames: u64,
     /// Maximum total bytes of `Assets<Image>` storage devoted to font
-    /// atlases. When `evict_stale` runs and totals exceed this cap, atlases
-    /// are dropped LRU-first until the cap is met. Default: 64 MiB. Set to
-    /// `u64::MAX` to disable size-based eviction.
+    /// atlases. When `evict_stale` runs and totals exceed this cap after
+    /// the weakref pass, the largest atlases are dropped until the cap is
+    /// met (this can drop in-use atlases under genuine memory pressure —
+    /// the renderer will re-rasterise next frame). Default: 64 MiB. Set to
+    /// `u64::MAX` to disable the backstop entirely.
     pub max_total_bytes: u64,
+    /// Deprecated, kept as a `u64::MAX`-defaulted no-op for backward
+    /// compatibility with downstream code that constructed
+    /// `FontAtlasEvictionConfig` literals naming this field. Time-based
+    /// eviction was removed — see `evict_stale` docs.
+    #[deprecated(
+        note = "max_idle_frames is no longer consulted; eviction is now \
+                weakref-trigger-based. This field will be removed in a \
+                future cleanup."
+    )]
+    pub max_idle_frames: u64,
 }
 
 impl Default for FontAtlasEvictionConfig {
     fn default() -> Self {
+        #[allow(deprecated)]
         Self {
-            max_idle_frames: 60 * 60 * 5,
             max_total_bytes: 64 * 1024 * 1024,
+            max_idle_frames: u64::MAX,
         }
     }
 }
@@ -219,7 +271,9 @@ impl Default for FontAtlasEvictionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SubpixelBucket;
+    use crate::{FontAtlas, SubpixelBucket};
+    use bevy_asset::Handle;
+    use bevy_math::UVec2;
 
     fn make_key(font_size_bits: u32) -> FontAtlasKey {
         FontAtlasKey {
@@ -232,115 +286,120 @@ mod tests {
         }
     }
 
+    /// Build a fresh atlas inside `images`. Returns the atlas (which only
+    /// holds a weak `AssetId<Image>`) and the strong handle returned by
+    /// `FontAtlas::new` so the caller can either keep it (simulating a
+    /// `TextLayoutInfo` reference) or drop it (simulating no live
+    /// references → eligible for weakref-trigger eviction).
+    fn make_atlas(images: &mut Assets<Image>) -> (FontAtlas, Handle<Image>) {
+        FontAtlas::new(images, UVec2::splat(64), FontSmoothing::AntiAliased)
+    }
+
     #[test]
-    fn touch_records_frame() {
+    fn touch_still_records_frame_for_back_compat() {
+        // touch/last_used_frame retained for back-compat with callers that
+        // still thread FrameCount through update_text_layout_info. The
+        // values are no longer consulted by eviction.
         let mut set = FontAtlasSet::default();
         let key = make_key(0);
         assert_eq!(set.last_used_frame(&key), 0);
         set.touch(key, 42);
         assert_eq!(set.last_used_frame(&key), 42);
-        set.touch(key, 100);
-        assert_eq!(set.last_used_frame(&key), 100);
     }
 
     #[test]
-    fn evict_stale_drops_idle_keys() {
-        let mut set = FontAtlasSet::default();
-        let mut images = Assets::<Image>::default();
-        let recent = make_key(0);
-        let stale = make_key(1);
-        // Insert empty atlas vecs so eviction has something to remove from
-        // the atlas map (touch-only entries also get pruned from
-        // last_used_frames, but we want both maps in lockstep).
-        set.atlases.insert(recent, Vec::new());
-        set.atlases.insert(stale, Vec::new());
-        set.touch(recent, 1000);
-        set.touch(stale, 100);
-
-        // current_frame = 1100, max_idle = 200 -> cutoff = 900.
-        // recent at 1000 > 900 (kept). stale at 100 < 900 (evicted).
-        let config = FontAtlasEvictionConfig {
-            max_idle_frames: 200,
-            max_total_bytes: u64::MAX,
-        };
-        let evicted = set.evict_stale(1100, &config, &mut images);
-        assert_eq!(evicted, 1);
-        assert!(set.atlases.contains_key(&recent));
-        assert!(!set.atlases.contains_key(&stale));
-        assert_eq!(set.last_used_frame(&recent), 1000);
-        assert_eq!(set.last_used_frame(&stale), 0);
-    }
-
-    #[test]
-    fn evict_stale_disabled_when_max_idle_is_u64_max() {
+    fn weakref_eviction_drops_atlas_when_image_was_reclaimed() {
+        // Pre-fix: time-based threshold could evict a still-in-use atlas if
+        // its key wasn't touch()'d this frame (shape gating skipped touch).
+        // Post-fix: eviction fires when the atlas's `Image` asset is no
+        // longer in `Assets<Image>`. We simulate that by removing the
+        // image directly (in real code, asset GC reaps after the last
+        // strong handle drops).
         let mut set = FontAtlasSet::default();
         let mut images = Assets::<Image>::default();
         let key = make_key(0);
-        set.atlases.insert(key, Vec::new());
-        set.touch(key, 0);
+        let (atlas, strong_handle) = make_atlas(&mut images);
+        let atlas_id = atlas.texture;
+        set.atlases.insert(key, vec![atlas]);
 
-        let config = FontAtlasEvictionConfig {
-            max_idle_frames: u64::MAX,
-            max_total_bytes: u64::MAX,
-        };
+        // Drop the strong handle and remove the image (simulating asset
+        // GC reaping after the last strong handle dropped at end of
+        // previous frame).
+        drop(strong_handle);
+        images.remove(atlas_id);
+
+        let config = FontAtlasEvictionConfig::default();
+        let evicted = set.evict_stale(0, &config, &mut images);
+        assert_eq!(evicted, 1);
+        assert!(!set.atlases.contains_key(&key));
+    }
+
+    #[test]
+    fn weakref_eviction_keeps_atlas_when_image_still_alive() {
+        // The user-directed model: while a `TextLayoutInfo` holds a strong
+        // handle, the image asset stays in `Assets<Image>`, so
+        // `evict_stale` keeps the atlas — even across many sweeps.
+        let mut set = FontAtlasSet::default();
+        let mut images = Assets::<Image>::default();
+        let key = make_key(0);
+        let (atlas, layout_strong) = make_atlas(&mut images);
+        let atlas_id = atlas.texture;
+        set.atlases.insert(key, vec![atlas]);
+
+        let config = FontAtlasEvictionConfig::default();
+        // Sweep multiple times. `images.contains(atlas_id)` is `true`
+        // throughout because `layout_strong` keeps the asset alive.
+        for _ in 0..5 {
+            let evicted = set.evict_stale(0, &config, &mut images);
+            assert_eq!(evicted, 0);
+            assert!(set.atlases.contains_key(&key));
+            assert!(images.contains(atlas_id));
+        }
+
+        // Drop the layout-side strong handle and remove the image
+        // (simulating end-of-frame asset GC). The next sweep reaps.
+        drop(layout_strong);
+        images.remove(atlas_id);
+        let evicted = set.evict_stale(0, &config, &mut images);
+        assert_eq!(evicted, 1);
+        assert!(!set.atlases.contains_key(&key));
+    }
+
+    #[test]
+    fn weakref_eviction_does_not_consult_idle_threshold() {
+        // The original bug (LS-gxrtooro): a still-in-use atlas was reaped
+        // because shape gating skipped touch() and the entry aged past the
+        // idle threshold. Post-fix, the only signal is whether the image
+        // is still in `Assets<Image>`: even if `current_frame` is far
+        // ahead of any touch timestamp, an atlas whose image is still
+        // alive is preserved.
+        let mut set = FontAtlasSet::default();
+        let mut images = Assets::<Image>::default();
+        let key = make_key(0);
+        let (atlas, _layout_strong) = make_atlas(&mut images);
+        set.atlases.insert(key, vec![atlas]);
+
+        // Pre-fix would have evicted with `current_frame = u64::MAX`
+        // (entire idle threshold elapsed). Post-fix retains the atlas
+        // because the strong handle keeps the image asset alive.
+        let config = FontAtlasEvictionConfig::default();
         let evicted = set.evict_stale(u64::MAX, &config, &mut images);
         assert_eq!(evicted, 0);
         assert!(set.atlases.contains_key(&key));
     }
 
     #[test]
-    fn evict_stale_handles_underflow_at_low_current_frame() {
-        // current_frame = 50, max_idle = 200. saturating_sub -> 0. No keys
-        // with frame < 0, so nothing is evicted (correct: at session start
-        // we shouldn't evict anything).
-        let mut set = FontAtlasSet::default();
-        let mut images = Assets::<Image>::default();
-        let key = make_key(0);
-        set.atlases.insert(key, Vec::new());
-        set.touch(key, 10);
-
-        let config = FontAtlasEvictionConfig {
-            max_idle_frames: 200,
-            max_total_bytes: u64::MAX,
-        };
-        let evicted = set.evict_stale(50, &config, &mut images);
-        assert_eq!(evicted, 0);
-        assert!(set.atlases.contains_key(&key));
-    }
-
-    #[test]
-    fn evict_stale_drops_last_used_frame_entries_for_keys_with_no_atlases() {
-        // If touch() has been called but the atlas map never got an entry
-        // (e.g. the lookup was for a font that failed to shape), the stale
-        // entry in last_used_frames should still be cleaned up so the map
-        // doesn't grow unbounded.
-        let mut set = FontAtlasSet::default();
-        let mut images = Assets::<Image>::default();
-        let key = make_key(0);
-        set.touch(key, 100);
-        assert_eq!(set.last_used_frame(&key), 100);
-
-        let config = FontAtlasEvictionConfig {
-            max_idle_frames: 50,
-            max_total_bytes: u64::MAX,
-        };
-        // current_frame=200, cutoff=150. key was touched at 100 < 150 -> evict.
-        let evicted = set.evict_stale(200, &config, &mut images);
-        // Returns 0 because evict_key only counts when the key was in `atlases`.
-        assert_eq!(evicted, 0);
-        // But last_used_frames was still cleaned up.
-        assert_eq!(set.last_used_frame(&key), 0);
-    }
-
-    #[test]
     fn default_config_sane_values() {
+        #[allow(deprecated)]
         let cfg = FontAtlasEvictionConfig::default();
-        assert!(cfg.max_idle_frames > 0);
-        assert!(cfg.max_total_bytes > 0);
-        // 5 minutes at 60 fps = 18000 frames.
-        assert_eq!(cfg.max_idle_frames, 18000);
-        // 64 MiB.
+        // Backstop cap is 64 MiB. max_idle_frames is the deprecated no-op,
+        // defaulted to u64::MAX (disabled) — kept only for the back-compat
+        // field-init path.
         assert_eq!(cfg.max_total_bytes, 64 * 1024 * 1024);
+        #[allow(deprecated)]
+        {
+            assert_eq!(cfg.max_idle_frames, u64::MAX);
+        }
     }
 
     // Compile-test: ensure SubpixelBucket import path still resolves.

@@ -1,4 +1,4 @@
-use bevy_asset::{Assets, Handle, RenderAssetUsages};
+use bevy_asset::{AssetId, Assets, Handle, RenderAssetUsages};
 use bevy_image::{prelude::*, ImageSampler, ToExtents};
 use bevy_math::{UVec2, Vec2};
 use bevy_platform::collections::HashMap;
@@ -106,17 +106,29 @@ pub struct FontAtlas {
     pub glyph_to_atlas_index: HashMap<GlyphCacheKey, GlyphAtlasLocation>,
     /// The layout for the font atlas.
     pub texture_atlas: TextureAtlasLayout,
-    /// The texture where this font atlas is located
-    pub texture: Handle<Image>,
+    /// svge-main fork (LS-gxrtooro): weak reference to the texture image.
+    /// Was previously a `Handle<Image>` (strong); now an [`AssetId<Image>`].
+    /// The strong reference for each atlas is held by the consuming
+    /// [`crate::TextLayoutInfo`] (via its `atlas_handles` vec). When the
+    /// last consumer drops its strong handle, the underlying `Image` is
+    /// reclaimed by the asset GC; [`crate::FontAtlasSet::evict_stale`]
+    /// notices via `Assets::contains` and drops the now-orphaned atlas.
+    pub texture: AssetId<Image>,
 }
 
 impl FontAtlas {
     /// Create a new [`FontAtlas`] with the given size, adding it to the appropriate asset collections.
+    ///
+    /// svge-main fork (LS-gxrtooro): returns the freshly-allocated strong
+    /// `Handle<Image>` alongside the atlas. **The caller MUST retain the
+    /// strong handle** (typically by pushing it into
+    /// `TextLayoutInfo::atlas_handles`) for the asset to stay alive — the
+    /// atlas itself only stores a weak [`AssetId<Image>`].
     pub fn new(
         textures: &mut Assets<Image>,
         size: UVec2,
         font_smoothing: FontSmoothing,
-    ) -> FontAtlas {
+    ) -> (FontAtlas, Handle<Image>) {
         let mut image = Image::new_fill(
             size.to_extents(),
             TextureDimension::D2,
@@ -128,13 +140,15 @@ impl FontAtlas {
         if font_smoothing == FontSmoothing::None {
             image.sampler = ImageSampler::nearest();
         }
-        let texture = textures.add(image);
-        Self {
+        let strong_handle = textures.add(image);
+        let texture_id = strong_handle.id();
+        let atlas = Self {
             texture_atlas: TextureAtlasLayout::new_empty(size),
             glyph_to_atlas_index: HashMap::default(),
             dynamic_texture_atlas_builder: DynamicTextureAtlasBuilder::new(size, 2),
-            texture,
-        }
+            texture: texture_id,
+        };
+        (atlas, strong_handle)
     }
 
     /// Get the [`GlyphAtlasLocation`] for a subpixel-offset glyph.
@@ -167,7 +181,7 @@ impl FontAtlas {
         is_alpha_mask: bool,
     ) -> Result<(), TextError> {
         let mut atlas_texture = textures
-            .get_mut(&self.texture)
+            .get_mut(self.texture)
             .ok_or(TextError::MissingAtlasTexture)?;
 
         if let Ok(glyph_index) = self.dynamic_texture_atlas_builder.add_texture(
@@ -201,7 +215,24 @@ impl core::fmt::Debug for FontAtlas {
     }
 }
 
-/// Adds the given subpixel-offset glyph to the given font atlases
+/// Adds the given subpixel-offset glyph to the given font atlases.
+///
+/// svge-main fork (LS-gxrtooro): on the new-atlas-allocation path this
+/// also returns the freshly-allocated strong [`Handle<Image>`] in
+/// `new_atlas_handle`. Callers (e.g. `TextPipeline::update_text_layout_info`)
+/// MUST retain this handle for the lifetime of any
+/// [`crate::TextLayoutInfo`] referencing the atlas — typically by pushing
+/// it onto `TextLayoutInfo::atlas_handles`. When the cache hits an existing
+/// atlas, `new_atlas_handle` is `None`; the caller should obtain a strong
+/// handle via `Assets::<Image>::get_strong_handle(atlas_info.texture)`
+/// instead.
+///
+/// Output is `(GlyphAtlasInfo, Option<Handle<Image>>)`:
+/// - `GlyphAtlasInfo` — same as upstream, contains `AssetId<Image>` plus
+///   atlas-pixel rect / offset / alpha-mask flag.
+/// - `Option<Handle<Image>>` — `Some` only when this call allocated a new
+///   atlas; `None` for cache hits and for the fast path where the glyph
+///   slotted into an existing atlas.
 pub fn add_glyph_to_atlas(
     font_atlases: &mut Vec<FontAtlas>,
     textures: &mut Assets<Image>,
@@ -210,7 +241,7 @@ pub fn add_glyph_to_atlas(
     glyph_id: u16,
     subpixel_bucket: SubpixelBucket,
     subpixel_offset: Vec2,
-) -> Result<GlyphAtlasInfo, TextError> {
+) -> Result<(GlyphAtlasInfo, Option<Handle<Image>>), TextError> {
     let (glyph_texture, offset, is_alpha_mask) =
         get_outlined_glyph_texture(scaler, glyph_id, font_smoothing, subpixel_offset)?;
     let cache_key = GlyphCacheKey {
@@ -220,6 +251,7 @@ pub fn add_glyph_to_atlas(
     let mut add_char_to_font_atlas = |atlas: &mut FontAtlas| -> Result<(), TextError> {
         atlas.add_glyph(textures, cache_key, &glyph_texture, offset, is_alpha_mask)
     };
+    let mut new_atlas_handle: Option<Handle<Image>> = None;
     if !font_atlases
         .iter_mut()
         .any(|atlas| add_char_to_font_atlas(atlas).is_ok())
@@ -233,14 +265,18 @@ pub fn add_glyph_to_atlas(
         // Pick the higher of 512 or the smallest power of 2 greater than glyph_max_size
         let containing = (1u32 << (32 - glyph_max_size.leading_zeros())).max(512);
 
-        let mut new_atlas = FontAtlas::new(textures, UVec2::splat(containing), font_smoothing);
+        let (mut new_atlas, strong_handle) =
+            FontAtlas::new(textures, UVec2::splat(containing), font_smoothing);
 
         new_atlas.add_glyph(textures, cache_key, &glyph_texture, offset, is_alpha_mask)?;
 
         font_atlases.push(new_atlas);
+        new_atlas_handle = Some(strong_handle);
     }
 
-    get_glyph_atlas_info(font_atlases, cache_key).ok_or(TextError::InconsistentAtlasState)
+    let info =
+        get_glyph_atlas_info(font_atlases, cache_key).ok_or(TextError::InconsistentAtlasState)?;
+    Ok((info, new_atlas_handle))
 }
 
 /// Get the texture of the glyph as a rendered image, and its offset
@@ -355,7 +391,10 @@ pub fn get_glyph_atlas_info(
             .map(|location| GlyphAtlasInfo {
                 offset: location.offset,
                 rect: atlas.texture_atlas.textures[location.glyph_index].as_rect(),
-                texture: atlas.texture.id(),
+                // svge-main fork: `atlas.texture` is now an `AssetId<Image>`
+                // directly (was previously a strong `Handle<Image>` whose
+                // `.id()` we extracted here).
+                texture: atlas.texture,
                 is_alpha_mask: location.is_alpha_mask,
             })
     })

@@ -312,6 +312,11 @@ pub fn update_editable_text_layout(
             info.preedit_underline_rects.clear();
             info.glyphs.clear();
             info.run_geometry.clear();
+            // svge-main fork (LS-gxrtooro): drop strong handles for the
+            // previous shape's atlases. Newly-allocated atlases below
+            // push fresh handles; cache hits promote via
+            // `Assets::get_strong_handle`.
+            info.atlas_handles.clear();
 
             for (line_index, line) in layout.lines().enumerate() {
                 for item in line.items() {
@@ -355,33 +360,64 @@ pub fn update_editable_text_layout(
 
                                 let font_atlases =
                                     font_atlas_set.entry(font_atlas_key).or_default();
-                                let Ok(atlas_info) = get_glyph_atlas_info(font_atlases, cache_key)
-                                    .map(Ok)
-                                    .unwrap_or_else(|| {
-                                        let font_ref = FontRef::from_index(
-                                            font_data.data.as_ref(),
-                                            font_data.index as usize,
-                                        )
-                                        .unwrap();
-                                        let mut scaler = scale_cx
-                                            .builder(font_ref)
-                                            .size(font_size)
-                                            .hint(matches!(*hinting, FontHinting::Enabled))
-                                            .normalized_coords(coords)
-                                            .build();
-                                        add_glyph_to_atlas(
-                                            font_atlases,
-                                            textures.as_mut(),
-                                            &mut scaler,
-                                            text_font.font_smoothing,
-                                            glyph.id as u16,
-                                            subpixel_bucket,
-                                            subpixel_offset,
-                                        )
-                                    })
-                                else {
-                                    continue;
+                                // svge-main fork (LS-gxrtooro):
+                                // `add_glyph_to_atlas` now returns
+                                // `(GlyphAtlasInfo, Option<Handle<Image>>)`;
+                                // the optional handle must be retained on
+                                // `info.atlas_handles`. For cache hits
+                                // (`get_glyph_atlas_info` succeeded),
+                                // promote the AssetId to a strong handle
+                                // via `Assets::get_strong_handle` and dedup
+                                // against handles already on the layout.
+                                let atlas_info = if let Some(info_) =
+                                    get_glyph_atlas_info(font_atlases, cache_key)
+                                {
+                                    info_
+                                } else {
+                                    let font_ref = FontRef::from_index(
+                                        font_data.data.as_ref(),
+                                        font_data.index as usize,
+                                    )
+                                    .unwrap();
+                                    let mut scaler = scale_cx
+                                        .builder(font_ref)
+                                        .size(font_size)
+                                        .hint(matches!(*hinting, FontHinting::Enabled))
+                                        .normalized_coords(coords)
+                                        .build();
+                                    let Ok((info_, new_handle)) = add_glyph_to_atlas(
+                                        font_atlases,
+                                        textures.as_mut(),
+                                        &mut scaler,
+                                        text_font.font_smoothing,
+                                        glyph.id as u16,
+                                        subpixel_bucket,
+                                        subpixel_offset,
+                                    ) else {
+                                        continue;
+                                    };
+                                    if let Some(h) = new_handle {
+                                        info.atlas_handles.push(h);
+                                    }
+                                    info_
                                 };
+
+                                // Promote cache-hit AssetIds to strong
+                                // handles too — but only if not already
+                                // tracked on this layout. Linear scan is
+                                // fine: `atlas_handles` is small (typical
+                                // 1-3 atlases per layout).
+                                if !info
+                                    .atlas_handles
+                                    .iter()
+                                    .any(|h| h.id() == atlas_info.texture)
+                                {
+                                    if let Some(h) =
+                                        textures.get_strong_handle(atlas_info.texture)
+                                    {
+                                        info.atlas_handles.push(h);
+                                    }
+                                }
 
                                 info.glyphs.push(PositionedGlyph {
                                     position: Vec2::new(glyph.x, glyph.y)

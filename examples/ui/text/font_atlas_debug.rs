@@ -40,7 +40,7 @@ fn atlas_render_system(
     mut commands: Commands,
     mut state: ResMut<State>,
     font_atlas_set: Res<FontAtlasSet>,
-    images: Res<Assets<Image>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     if let Some(font_atlases) = font_atlas_set.values().next() {
         let x_offset = state.atlas_count as f32;
@@ -48,14 +48,19 @@ fn atlas_render_system(
             return;
         }
         let font_atlas = &font_atlases[state.atlas_count as usize];
-        let image = images.get(&font_atlas.texture).unwrap();
+        // svge-main fork (LS-gxrtooro): `font_atlas.texture` is now an
+        // `AssetId<Image>` (weak ref). To spawn an `ImageNode` we need a
+        // strong handle so the asset stays alive while displayed; promote
+        // via `Assets::get_strong_handle`.
+        let image_size = images.get(font_atlas.texture).unwrap().width() as f32;
+        let strong_handle = images.get_strong_handle(font_atlas.texture).unwrap();
         state.atlas_count += 1;
         commands.spawn((
-            ImageNode::new(font_atlas.texture.clone()),
+            ImageNode::new(strong_handle),
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::ZERO,
-                left: px(image.width() as f32 * x_offset),
+                left: px(image_size * x_offset),
                 ..default()
             },
         ));

@@ -55,7 +55,16 @@ fn rasterise_bucket(
     let subpixel_bucket = SubpixelBucket::from_fract(fractional_x, font_smoothing);
     let subpixel_offset = Vec2::new(subpixel_bucket.rasterise_offset_x(), 0.0);
 
-    add_glyph_to_atlas(
+    // svge-main fork (LS-gxrtooro): `add_glyph_to_atlas` now returns
+    // `(GlyphAtlasInfo, Option<Handle<Image>>)`. The test doesn't care
+    // about the handle here — it only inspects the atlas/cache layout —
+    // but the strong handle has to be retained for the duration of the
+    // test (otherwise the asset GC would reap the atlas image and the
+    // next call would fail to write into it). We let it drop at the end
+    // of the function since the test outer fn keeps `textures` alive
+    // until the end of the test anyway via the unfinalised drop tracking
+    // (no `track_assets` system runs in this raw test setup).
+    let (_info, _new_handle) = add_glyph_to_atlas(
         font_atlases,
         textures,
         &mut scaler,
