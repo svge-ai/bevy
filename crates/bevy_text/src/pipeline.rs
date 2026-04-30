@@ -298,6 +298,12 @@ impl TextPipeline {
     }
 
     /// Update [`TextLayoutInfo`] with the new [`PositionedGlyph`] layout.
+    ///
+    /// `current_frame` is forwarded to [`FontAtlasSet::touch`] so the LRU
+    /// eviction tracking (svge-main fork) sees this frame as the last
+    /// access for every `FontAtlasKey` exercised here. Pass
+    /// `frame_count.0 as u64` from a system that has `Res<FrameCount>`,
+    /// or `0` if eviction tracking is not desired.
     pub fn update_text_layout_info(
         &mut self,
         layout_info: &mut TextLayoutInfo,
@@ -308,6 +314,7 @@ impl TextPipeline {
         bounds: TextBounds,
         justify: Justify,
         hinting: FontHinting,
+        current_frame: u64,
     ) -> Result<(), TextError> {
         computed.needs_rerender = false;
         layout_info.clear();
@@ -333,6 +340,11 @@ impl TextPipeline {
                         hinting,
                         font_smoothing,
                     };
+
+                    // svge-main: mark this key as touched on the current
+                    // frame so the LRU eviction in `FontAtlasSet::evict_stale`
+                    // doesn't drop atlases for actively-rendered text.
+                    font_atlas_set.touch(font_atlas_key, current_frame);
 
                     let Some(font_ref) =
                         FontRef::from_index(font.data.as_ref(), font.index as usize)

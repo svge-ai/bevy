@@ -368,6 +368,12 @@ pub fn text_system(
                 TextBounds::new(content_box_size.x, content_box_size.y)
             };
 
+            // svge-main fork: `current_frame` participates in LRU eviction
+            // tracking. bevy_ui doesn't currently depend on `bevy_diagnostic`,
+            // so we pass `0` here — bevy_ui's text path is not the primary
+            // target for LRU eviction. Consumers that drive eviction
+            // (e.g. liveskill's text-shaping systems) thread the real
+            // `FrameCount` through their own `update_text_layout_info` calls.
             match text_pipeline.update_text_layout_info(
                 &mut text_layout_info,
                 &mut font_atlas_set,
@@ -377,6 +383,7 @@ pub fn text_system(
                 physical_node_size,
                 block.justify,
                 *hinting,
+                0,
             ) {
                 Err(
                     TextError::NoSuchFont

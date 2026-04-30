@@ -334,6 +334,15 @@ pub fn update_editable_text_layout(
                                 font_smoothing: brush.font_smoothing,
                             };
 
+                            // svge-main fork: touch with frame=0 because
+                            // bevy_ui doesn't depend on `bevy_diagnostic` for
+                            // a real `FrameCount`. bevy_ui's editable-text
+                            // widget is not the primary LRU target; consumers
+                            // that need accurate eviction (e.g. liveskill)
+                            // drive shaping through their own systems with
+                            // real frame numbers.
+                            font_atlas_set.touch(font_atlas_key, 0);
+
                             for glyph in glyph_run.positioned_glyphs() {
                                 let subpixel_bucket =
                                     SubpixelBucket::from_fract(glyph.x, text_font.font_smoothing);

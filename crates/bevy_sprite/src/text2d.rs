@@ -305,6 +305,9 @@ pub fn update_text2d_layout(
             }
         }
 
+        // svge-main fork: pass frame=0; bevy_sprite's text2d is not the
+        // primary LRU target. Consumers driving eviction pass real
+        // FrameCount through their own systems.
         match text_pipeline.update_text_layout_info(
             &mut text_layout_info,
             &mut font_atlas_set,
@@ -314,6 +317,7 @@ pub fn update_text2d_layout(
             text_bounds,
             block.justify,
             *hinting,
+            0,
         ) {
             Err(TextError::NoSuchFont | TextError::NoSuchFontFamily(_)) => {
                 // There was an error processing the text layout.
