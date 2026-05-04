@@ -13,6 +13,16 @@ use bevy_utils::default;
 use bevy_window::{
     CompositeAlphaMode, PresentMode, PrimaryWindow, RawHandleWrapper, Window, WindowClosing,
 };
+
+// svge-main fork: threshold for forcing a surface reconfigure when
+// `surface.get_current_texture()` returns silent-fail variants
+// (Timeout-on-mesa / Occluded / Outdated→failed-after-reconfig) for
+// `FORCE_RECONFIGURE_AFTER_SILENT_FAILS` consecutive frames. Empirical
+// LS-njlpwmbz observation on AMD Radeon 890M / mesa-RADV: once the
+// surface enters this state it never recovers without a fresh
+// `configure_surface()`. 10 frames = ~167 ms at 60 fps; gives the
+// driver a chance to recover naturally before forcing the issue.
+const FORCE_RECONFIGURE_AFTER_SILENT_FAILS: u64 = 10;
 use core::{
     num::NonZero,
     ops::{Deref, DerefMut},
@@ -35,6 +45,11 @@ impl Plugin for WindowRenderPlugin {
             render_app
                 .init_gpu_resource::<ExtractedWindows>()
                 .init_gpu_resource::<WindowSurfaces>()
+                // svge-main fork: SurfaceAcquisitionStats counter resource
+                // updated by `prepare_windows`. See LS-njlpwmbz forensic
+                // (liveskill repo) — silent-fail variants are otherwise
+                // invisible to consumers.
+                .init_gpu_resource::<SurfaceAcquisitionStats>()
                 .add_systems(ExtractSchedule, extract_windows.before(extract_cameras))
                 .add_systems(
                     Render,
@@ -45,6 +60,58 @@ impl Plugin for WindowRenderPlugin {
                 .add_systems(Render, prepare_windows.in_set(RenderSystems::PrepareViews));
         }
     }
+}
+
+/// svge-main fork: per-window swap-chain acquisition counters.
+///
+/// `prepare_windows` calls `surface.get_current_texture()` once per
+/// frame per window. Under upstream behaviour, several variants are
+/// swallowed silently:
+///
+/// - `Timeout` on Linux + mesa-RADV/AMD/Intel logs at `trace!` (invisible
+///   at default log levels).
+/// - `Occluded` is `{}` — no log, no counter.
+/// - `Outdated` is reconfigured-and-retried, but if the retry also fails
+///   the warning is logged once and the variant is silently dropped.
+///
+/// Without per-variant visibility, downstream consumers cannot tell
+/// **why** their renderer wedged — they just see ViewTarget components
+/// silently removed by `prepare_view_targets` and a stalled render-graph.
+/// This resource exposes the counts so investigators can bisect, and
+/// `consecutive_silent_fails` lets us trigger defensive recovery.
+///
+/// Reset semantics: every counter monotonically increments. Only
+/// `consecutive_silent_fails` is reset (to 0) — and only on either a
+/// successful Ok/Suboptimal acquisition OR after a forced recovery
+/// reconfigure fires.
+#[derive(Resource, Debug, Default, Clone)]
+pub struct SurfaceAcquisitionStats {
+    /// `Success` + `Suboptimal` — frames that produced a usable texture.
+    pub ok: u64,
+    /// `Timeout` (on Linux mesa-RADV / AMD / Intel guard path).
+    pub timeout: u64,
+    /// `Outdated` — typically resize / present-mode change. Reconfigure
+    /// fires automatically; this counts the *initial* Outdated, not
+    /// the subsequent retry.
+    pub outdated: u64,
+    /// `Lost` (catch-all `other` arm of the upstream match) when the
+    /// `bevy_log::error!` path fires.
+    pub lost: u64,
+    /// Anything else that hit the catch-all error log path.
+    pub other_error: u64,
+    /// `Occluded` — the persistent-on-mesa-RADV silent path that
+    /// LS-njlpwmbz traced.
+    pub occluded: u64,
+    /// Consecutive frames where acquisition failed silently (Timeout /
+    /// Occluded / Outdated→retry-failed). Reset to 0 on Ok/Suboptimal
+    /// or after the defensive `configure_surface()` fires. When this
+    /// crosses [`FORCE_RECONFIGURE_AFTER_SILENT_FAILS`], we force a
+    /// reconfigure to escape stuck-surface state.
+    pub consecutive_silent_fails: u64,
+    /// Number of times the defensive force-reconfigure has fired since
+    /// process boot. A non-zero value means the surface entered the
+    /// stuck state at least once and we recovered automatically.
+    pub forced_reconfigures: u64,
 }
 
 pub struct ExtractedWindow {
@@ -247,6 +314,10 @@ pub fn prepare_windows(
     render_device: Res<RenderDevice>,
     sorted_cameras: Res<crate::camera::SortedCameras>,
     #[cfg(target_os = "linux")] render_instance: Res<RenderInstance>,
+    // svge-main fork: per-variant surface-acquisition counters +
+    // defensive recovery from persistent silent-fail states. See
+    // LS-njlpwmbz forensic.
+    mut surface_stats: ResMut<SurfaceAcquisitionStats>,
 ) {
     for window in windows.windows.values_mut() {
         // Skip acquiring a swap-chain texture for windows that no camera
@@ -300,24 +371,63 @@ pub fn prepare_windows(
         };
 
         let surface = &surface_data.surface;
+        // svge-main fork: track whether this frame's acquisition fell
+        // into a silent-fail bucket so we can manage the consecutive
+        // counter + force recovery.
+        let mut silent_fail_this_frame = false;
         match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
+                surface_stats.ok = surface_stats.ok.saturating_add(1);
                 window.set_swapchain_texture(surface_texture);
             }
             #[cfg(target_os = "linux")]
             wgpu::CurrentSurfaceTexture::Timeout if may_erroneously_timeout() => {
-                bevy_log::trace!(
-                    "Couldn't get swap chain texture. This is probably a quirk \
-                        of your Linux GPU driver, so it can be safely ignored."
+                surface_stats.timeout = surface_stats.timeout.saturating_add(1);
+                silent_fail_this_frame = true;
+                // svge-main fork: promoted from `trace!` to `debug!` so
+                // investigators can observe Timeout without rebuilding
+                // bevy with custom log filters. Stays below `warn!`
+                // because mesa-RADV's spurious timeouts are routine and
+                // would be log noise.
+                debug!(
+                    target: "bevy_render::view::window",
+                    "Couldn't get swap chain texture (Timeout). This is \
+                        a quirk of Linux mesa-RADV / AMD / Intel adapters."
                 );
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
+                surface_stats.outdated = surface_stats.outdated.saturating_add(1);
                 render_device.configure_surface(surface, &surface_data.configuration);
                 let frame = match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(surface_texture)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => surface_texture,
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
+                        // The Outdated→reconfig→Ok path counts as both an
+                        // Outdated *and* an Ok — the reconfigure recovered.
+                        surface_stats.ok = surface_stats.ok.saturating_add(1);
+                        surface_texture
+                    }
                     variant => {
+                        // svge-main fork: bucket the post-reconfig failure
+                        // by variant when possible. Bump the consecutive
+                        // silent-fail counter inline (we `continue` past
+                        // the bottom-of-loop bookkeeping below).
+                        match &variant {
+                            wgpu::CurrentSurfaceTexture::Occluded => {
+                                surface_stats.occluded =
+                                    surface_stats.occluded.saturating_add(1);
+                            }
+                            wgpu::CurrentSurfaceTexture::Timeout => {
+                                surface_stats.timeout =
+                                    surface_stats.timeout.saturating_add(1);
+                            }
+                            _ => {
+                                surface_stats.other_error =
+                                    surface_stats.other_error.saturating_add(1);
+                            }
+                        }
+                        surface_stats.consecutive_silent_fails =
+                            surface_stats.consecutive_silent_fails.saturating_add(1);
                         // This is a common occurrence on X11 and Xwayland with NVIDIA drivers
                         // when opening and resizing the window.
                         warn!(
@@ -328,11 +438,56 @@ pub fn prepare_windows(
                 };
                 window.set_swapchain_texture(frame);
             }
-            wgpu::CurrentSurfaceTexture::Occluded => {}
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                surface_stats.occluded = surface_stats.occluded.saturating_add(1);
+                silent_fail_this_frame = true;
+            }
             other => {
+                // svge-main fork: split lost vs other_error so consumers
+                // can tell device-loss from generic acquisition failure.
+                if matches!(&other, wgpu::CurrentSurfaceTexture::Lost) {
+                    surface_stats.lost = surface_stats.lost.saturating_add(1);
+                } else {
+                    surface_stats.other_error =
+                        surface_stats.other_error.saturating_add(1);
+                }
+                silent_fail_this_frame = true;
                 bevy_log::error!("Couldn't get swap chain texture: {other:?}");
             }
         }
+
+        // svge-main fork: defensive recovery from persistent silent-fail
+        // states. mesa-RADV under sustained presentation pressure can
+        // wedge into a state where every subsequent acquisition returns
+        // Timeout or Occluded — without intervention this never recovers
+        // (LS-njlpwmbz: 1 FPS lock-in until process restart). When we
+        // hit the threshold, force a `configure_surface` to escape the
+        // stuck state. Counter resets so we don't reconfigure every frame.
+        if silent_fail_this_frame {
+            surface_stats.consecutive_silent_fails =
+                surface_stats.consecutive_silent_fails.saturating_add(1);
+            if surface_stats.consecutive_silent_fails
+                >= FORCE_RECONFIGURE_AFTER_SILENT_FAILS
+            {
+                info!(
+                    target: "bevy_render::view::window",
+                    "SurfaceAcquisitionStats: forcing configure_surface after \
+                     {} consecutive silent fails (timeout={}, occluded={}, \
+                     forced_reconfigures={}).",
+                    surface_stats.consecutive_silent_fails,
+                    surface_stats.timeout,
+                    surface_stats.occluded,
+                    surface_stats.forced_reconfigures.saturating_add(1),
+                );
+                render_device.configure_surface(surface, &surface_data.configuration);
+                surface_stats.forced_reconfigures =
+                    surface_stats.forced_reconfigures.saturating_add(1);
+                surface_stats.consecutive_silent_fails = 0;
+            }
+        } else {
+            surface_stats.consecutive_silent_fails = 0;
+        }
+
         window.swap_chain_texture_format = Some(surface_data.configuration.format);
     }
 }
